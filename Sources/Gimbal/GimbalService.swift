@@ -1,0 +1,403 @@
+import Combine
+import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.gimbal.controller", category: "Gimbal")
+
+/// High-level API for controlling a DJI Osmo Mobile gimbal.
+/// Orchestrates BLE transport, DUML protocol, and observable state.
+@MainActor
+final class GimbalService: ObservableObject {
+    let state = GimbalState()
+    let cameraTracker = CameraTracker()
+
+    private let connectionManager = BLEConnectionManager()
+    private let packetBuilder = DUMLPacketBuilder()
+    private let packetParser = DUMLPacketParser()
+    private var batteryPollTimer: Timer?
+    private var speedTimer: Timer?
+    private var currentSpeedYaw: Double = 0
+    private var currentSpeedPitch: Double = 0
+    private var currentSpeedRoll: Double = 0
+    private var cancellables = Set<AnyCancellable>()
+
+    init() {
+        // Forward GimbalState changes so SwiftUI views observing
+        // GimbalService also refresh when nested state changes.
+        state.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+        setupBindings()
+    }
+
+    // MARK: - Connection
+
+    func startScan() {
+        connectionManager.startScan()
+    }
+
+    func stopScan() {
+        connectionManager.stopScan()
+    }
+
+    func connect(to device: DiscoveredGimbal) {
+        packetBuilder.resetSequence()
+        packetParser.reset()
+        connectionManager.connect(to: device)
+    }
+
+    func disconnect() {
+        stopSpeedTimer()
+        stopBatteryPolling()
+        connectionManager.disconnect()
+    }
+
+    // MARK: - Gimbal Control
+
+    /// Start or update continuous speed control. Call with (0,0,0) to stop.
+    func setSpeed(yaw: Double, pitch: Double, roll: Double) {
+        currentSpeedYaw = yaw
+        currentSpeedPitch = pitch
+        currentSpeedRoll = roll
+
+        if yaw == 0 && pitch == 0 && roll == 0 {
+            stopSpeedTimer()
+            // Send one final stop command
+            let cmd = GimbalCommand.rotate(mode: .speed, yaw: 0, pitch: 0, roll: 0)
+            sendCommand(cmd)
+        } else {
+            startSpeedTimer()
+        }
+    }
+
+    func recenter() {
+        let cmd = GimbalCommand.rotate(mode: .absolutePosition, yaw: 0, pitch: 0, roll: 0, time: 20)
+        sendCommand(cmd)
+    }
+
+    /// Send the EXACT om-research rotation packet bytes.
+    /// This bypasses our packet builder entirely to test with known-good bytes.
+    func sendExactOMResearchRotation(yaw: Int16 = 1500) {
+        // Build EXACT om-research packet byte-by-byte:
+        // header = [0x55, 0x15, 0x04, 0xa9]
+        // body = [0x02, 0x04, 0x01, 0x00, 0x00, 0x04, 0x0c]
+        // payload = yaw(2) + roll(2) + pitch(2) + mode(1) + time(1)
+        // crc16 over body+payload with init=0xdf0c
+
+        var packet: [UInt8] = [
+            0x55, 0x15, 0x04, 0xA9,  // header (SOF + len=21 + ver=1 + CRC8)
+            0x02,                      // sender: mobileApp
+            0x04,                      // receiver: gimbal
+            0x01, 0x00,                // sequence = 1 (LE)
+            0x00,                      // cmdType = request
+            0x04,                      // cmdSet = gimbal
+            0x0C,                      // cmdID = speedControl
+        ]
+
+        // Payload: yaw(LE) + roll(LE) + pitch(LE) + mode + time
+        let yawBytes = withUnsafeBytes(of: yaw.littleEndian) { Array($0) }
+        packet.append(contentsOf: yawBytes) // yaw
+        packet.append(contentsOf: [0x00, 0x00]) // roll = 0
+        packet.append(contentsOf: [0x00, 0x00]) // pitch = 0
+        packet.append(0x80) // mode = SPEED
+        packet.append(0x00) // time = 0
+
+        // CRC16 over full packet (bytes 0..18) with init 0x3692
+        // (equivalent to om-research's body+payload with init 0xdf0c)
+        let crc = CRC16.compute(packet)
+        packet.append(UInt8(crc & 0xFF))
+        packet.append(UInt8((crc >> 8) & 0xFF))
+
+        let data = Data(packet)
+        let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+        state.packetLog.append("EXACT-OM yaw=\(yaw): \(hex)")
+
+        connectionManager.send(data)
+        logger.info("Sent exact om-research packet: \(hex)")
+    }
+
+    /// Send exact om-research packet to a specific characteristic (not just FFF5)
+    func sendExactOMResearchToChar(_ charUUID: String, yaw: Int16 = 1500) {
+        var packet: [UInt8] = [
+            0x55, 0x15, 0x04, 0xA9,
+            0x02, 0x04, 0x01, 0x00, 0x00, 0x04, 0x0C,
+        ]
+        let yawBytes = withUnsafeBytes(of: yaw.littleEndian) { Array($0) }
+        packet.append(contentsOf: yawBytes)
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
+        packet.append(0x80)
+        packet.append(0x00)
+        let crc = CRC16.compute(packet)
+        packet.append(UInt8(crc & 0xFF))
+        packet.append(UInt8((crc >> 8) & 0xFF))
+
+        let data = Data(packet)
+        let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+        state.packetLog.append("EXACT-OM→\(charUUID) yaw=\(yaw): \(hex)")
+
+        connectionManager.sendToCharacteristic(data, uuid: charUUID)
+    }
+
+    /// Brute-force protocol discovery: try speed payload with many cmdSet/cmdID combos.
+    func probeNextCommand() {
+        let speedPayload = GimbalCommand.rotate(mode: .speed, yaw: 1500, pitch: 0, roll: 0)
+
+        let probes: [(UInt8, UInt8, String)] = [
+            (0x04, 0x01, "gimbal/control"),
+            (0x04, 0x0A, "gimbal/extCtrlDegree"),
+            (0x04, 0x0C, "gimbal/speedControl"),
+            (0x04, 0x14, "gimbal/absAngleCtrl"),
+            (0x04, 0x15, "gimbal/movement"),
+            (0x0E, 0x01, "handheld/control"),
+            (0x0E, 0x0A, "handheld/extCtrlDegree"),
+            (0x0E, 0x0C, "handheld/speedControl"),
+            (0x0E, 0x14, "handheld/absAngleCtrl"),
+            (0x0E, 0x15, "handheld/movement"),
+        ]
+
+        let idx = state.probeIndex % probes.count
+        let (cmdSet, cmdID, desc) = probes[idx]
+        state.probeIndex += 1
+
+        let packet = packetBuilder.build(
+            cmdSet: cmdSet,
+            cmdID: cmdID,
+            payload: speedPayload.payload
+        )
+        connectionManager.send(packet)
+
+        let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+        state.packetLog.append("PROBE[\(idx)] \(desc) (set=0x\(String(format: "%02X", cmdSet)) id=0x\(String(format: "%02X", cmdID)))")
+        state.packetLog.append("  TX: \(hex)")
+        logger.info("PROBE \(desc): \(hex)")
+    }
+
+    func setMode(_ mode: GimbalMode) {
+        sendCommand(GimbalCommand.setMode(mode))
+        state.currentMode = mode
+    }
+
+    func setMotorState(on: Bool) {
+        sendCommand(GimbalCommand.setMotorState(on: on))
+        state.isMotorOn = on
+    }
+
+    func startCalibration() {
+        state.calibration = .inProgress(progress: 0)
+        sendCommand(GimbalCommand.startCalibration())
+    }
+
+    func requestBatteryStatus() {
+        sendCommand(GimbalCommand.requestBatteryStatus())
+    }
+
+    func requestPosition() {
+        sendCommand(GimbalCommand.requestPosition())
+    }
+
+    func toggleWriteType() {
+        connectionManager.toggleWriteType()
+    }
+
+    var writeTypeDescription: String {
+        connectionManager.currentWriteTypeDescription
+    }
+
+    var bleCharacteristics: [DiscoveredCharacteristic] {
+        connectionManager.allCharacteristics
+    }
+
+    // MARK: - Private
+
+    private func sendCommand(_ cmd: (cmdSet: UInt8, cmdID: UInt8, payload: Data)) {
+        let packet = packetBuilder.build(
+            cmdSet: cmd.cmdSet,
+            cmdID: cmd.cmdID,
+            payload: cmd.payload
+        )
+        connectionManager.send(packet)
+
+        let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+        logger.debug("TX: \(hex)")
+
+        // Show TX in debug log (but throttle speed commands to avoid spam)
+        let cmdIDStr = String(format: "0x%02X", cmd.cmdID)
+        if cmd.cmdID != DUMLConstants.GimbalCmd.speedControl.rawValue {
+            state.packetLog.append("TX [set=0x\(String(format: "%02X", cmd.cmdSet)) id=\(cmdIDStr)] \(hex)")
+        }
+    }
+
+    private func setupBindings() {
+        // Forward connection state
+        connectionManager.$connectionState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newState in
+                self?.state.connectionState = newState
+                if case .ready = newState {
+                    self?.onConnected()
+                }
+                if case .disconnected = newState {
+                    self?.onDisconnected()
+                }
+            }
+            .store(in: &cancellables)
+
+        // Forward discovered devices
+        connectionManager.$discoveredDevices
+            .receive(on: DispatchQueue.main)
+            .assign(to: &state.$discoveredDevices)
+
+        // Forward BLE characteristics
+        connectionManager.$allCharacteristics
+            .receive(on: DispatchQueue.main)
+            .assign(to: &state.$bleCharacteristics)
+
+        // Handle incoming BLE data
+        connectionManager.onDataReceived = { [weak self] data in
+            Task { @MainActor in
+                self?.handleIncomingData(data)
+            }
+        }
+
+        // Handle BLE log messages
+        connectionManager.onLogMessage = { [weak self] msg in
+            Task { @MainActor in
+                self?.state.packetLog.append(msg)
+                if (self?.state.packetLog.count ?? 0) > 200 {
+                    self?.state.packetLog.removeFirst()
+                }
+            }
+        }
+    }
+
+    private func onConnected() {
+        state.isMotorOn = true // gimbal starts with motors on
+        startBatteryPolling()
+        // Request initial state
+        requestBatteryStatus()
+        requestPosition()
+        logger.info("Gimbal connected and ready")
+    }
+
+    private func onDisconnected() {
+        stopBatteryPolling()
+        stopSpeedTimer()
+        packetParser.reset()
+        state.battery = BatteryStatus()
+        state.currentPosition = GimbalPosition()
+        state.isMotorOn = false
+        logger.info("Gimbal disconnected")
+    }
+
+    private func startSpeedTimer() {
+        guard speedTimer == nil else { return }
+        speedTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let cmd = GimbalCommand.rotate(
+                    mode: .speed,
+                    yaw: self.currentSpeedYaw,
+                    pitch: self.currentSpeedPitch,
+                    roll: self.currentSpeedRoll
+                )
+                self.sendCommand(cmd)
+            }
+        }
+    }
+
+    private func stopSpeedTimer() {
+        speedTimer?.invalidate()
+        speedTimer = nil
+    }
+
+    private func startBatteryPolling() {
+        batteryPollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.requestBatteryStatus()
+            }
+        }
+    }
+
+    private func stopBatteryPolling() {
+        batteryPollTimer?.invalidate()
+        batteryPollTimer = nil
+    }
+
+    // MARK: - Packet Handling
+
+    private func handleIncomingData(_ data: Data) {
+        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
+        logger.debug("RX: \(hex)")
+
+        let packets = packetParser.feed(data)
+        for packet in packets {
+            routePacket(packet)
+        }
+    }
+
+    private func routePacket(_ packet: DUMLPacket) {
+        // Add to debug log (keep last 200)
+        let desc = packet.description
+        state.packetLog.append(desc)
+        if state.packetLog.count > 200 {
+            state.packetLog.removeFirst()
+        }
+
+        switch (packet.cmdSet, packet.cmdID) {
+        case (0x05, 0x06): // Battery status push
+            parseBatteryStatus(packet.payload)
+
+        case (0x04, 0x02): // Position response
+            parsePosition(packet.payload)
+
+        case (0x04, 0x30): // Auto-calibration status
+            parseCalibrationStatus(packet.payload)
+
+        // Track ACK/NACK for rotation commands
+        case (0x04, 0x0C): // Speed control response
+            let payloadHex = packet.payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+            state.packetLog.append("  → SPEED_CTRL response: \(payloadHex) (cmdType=0x\(String(format: "%02X", packet.cmdType)))")
+
+        case (0x04, 0x14): // Angle control response
+            let payloadHex = packet.payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+            state.packetLog.append("  → ANGLE_CTRL response: \(payloadHex) (cmdType=0x\(String(format: "%02X", packet.cmdType)))")
+
+        case (0x04, 0x01): // Control response
+            let payloadHex = packet.payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+            state.packetLog.append("  → CONTROL response: \(payloadHex) (cmdType=0x\(String(format: "%02X", packet.cmdType)))")
+
+        default:
+            // Log all unknown packets with more detail
+            logger.info("RX packet: set=0x\(String(format: "%02X", packet.cmdSet)) id=0x\(String(format: "%02X", packet.cmdID)) type=0x\(String(format: "%02X", packet.cmdType))")
+        }
+    }
+
+    private func parseBatteryStatus(_ payload: Data) {
+        guard !payload.isEmpty else { return }
+        state.battery.level = Int(payload[0])
+        if payload.count > 1 {
+            state.battery.isCharging = payload[payload.count - 1] == 0x01
+        }
+        logger.info("Battery: \(self.state.battery.level)%\(self.state.battery.isCharging ? " (charging)" : "")")
+    }
+
+    private func parsePosition(_ payload: Data) {
+        guard payload.count >= 6 else { return }
+        let yaw = Double(payload.withUnsafeBytes { $0.load(fromByteOffset: 0, as: Int16.self) }) / 10.0
+        let roll = Double(payload.withUnsafeBytes { $0.load(fromByteOffset: 2, as: Int16.self) }) / 10.0
+        let pitch = Double(payload.withUnsafeBytes { $0.load(fromByteOffset: 4, as: Int16.self) }) / 10.0
+        state.currentPosition = GimbalPosition(yaw: yaw, pitch: pitch, roll: roll)
+    }
+
+    private func parseCalibrationStatus(_ payload: Data) {
+        guard !payload.isEmpty else { return }
+        let progress = Int(payload[0])
+        if progress >= 100 {
+            state.calibration = .completed
+        } else {
+            state.calibration = .inProgress(progress: progress)
+        }
+    }
+}
