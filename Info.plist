@@ -18,6 +18,8 @@
     <string>13.0</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Gimbal Controller needs Bluetooth to connect to your DJI gimbal.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Gimbal Controller uses the camera for face and person tracking to control the gimbal.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

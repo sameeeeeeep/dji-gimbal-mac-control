@@ -30,6 +30,11 @@ final class GimbalService: ObservableObject {
             }
             .store(in: &cancellables)
         setupBindings()
+
+        // Wire camera follow → gimbal speed so it works even without TrackingView open
+        cameraTracker.onSpeedCommand = { [weak self] yaw, pitch in
+            self?.setSpeed(yaw: yaw, pitch: pitch, roll: 0)
+        }
     }
 
     // MARK: - Connection
