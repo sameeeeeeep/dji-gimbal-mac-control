@@ -45,6 +45,11 @@ final class GimbalService: ObservableObject {
         cameraTracker.getCurrentPosition = { [weak self] in
             self?.state.currentPosition ?? GimbalPosition()
         }
+
+        // Let tracker request a fresh position reading during room sweep
+        cameraTracker.onRequestPosition = { [weak self] in
+            self?.requestPosition()
+        }
     }
 
     // MARK: - Connection
