@@ -35,6 +35,16 @@ final class GimbalService: ObservableObject {
         cameraTracker.onSpeedCommand = { [weak self] yaw, pitch in
             self?.setSpeed(yaw: yaw, pitch: pitch, roll: 0)
         }
+
+        // Wire absolute angle commands for serpentine scan
+        cameraTracker.onAbsoluteMove = { [weak self] yaw, pitch, time in
+            self?.absoluteRotate(yaw: yaw, pitch: pitch, time: time)
+        }
+
+        // Give tracker access to current gimbal position
+        cameraTracker.getCurrentPosition = { [weak self] in
+            self?.state.currentPosition ?? GimbalPosition()
+        }
     }
 
     // MARK: - Connection
@@ -79,6 +89,14 @@ final class GimbalService: ObservableObject {
 
     func recenter() {
         let cmd = GimbalCommand.rotate(mode: .absolutePosition, yaw: 0, pitch: 0, roll: 0, time: 20)
+        sendCommand(cmd)
+    }
+
+    /// Move gimbal to an absolute angle position.
+    func absoluteRotate(yaw: Double, pitch: Double, time: UInt8 = 20) {
+        // Stop any ongoing speed control first
+        stopSpeedTimer()
+        let cmd = GimbalCommand.rotate(mode: .absoluteAngle, yaw: yaw, pitch: pitch, roll: 0, time: time)
         sendCommand(cmd)
     }
 

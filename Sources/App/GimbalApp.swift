@@ -4,6 +4,7 @@ import SwiftUI
 struct GimbalApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var gimbalService = GimbalService()
+    @StateObject private var presetsManager = PresetsManager()
 
     var body: some Scene {
         WindowGroup("Gimbal Controller") {
@@ -25,6 +26,12 @@ struct GimbalApp: App {
                         TrackingView(gimbal: gimbalService, tracker: gimbalService.cameraTracker)
                     } label: {
                         Label("Tracking", systemImage: "camera.fill")
+                    }
+
+                    NavigationLink {
+                        PresetsView(gimbal: gimbalService, presets: presetsManager)
+                    } label: {
+                        Label("Presets", systemImage: "bookmark.fill")
                     }
 
                     NavigationLink {

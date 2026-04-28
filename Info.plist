@@ -20,6 +20,10 @@
     <string>Gimbal Controller needs Bluetooth to connect to your DJI gimbal.</string>
     <key>NSCameraUsageDescription</key>
     <string>Gimbal Controller uses the camera for face and person tracking to control the gimbal.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Gimbal Controller uses the microphone for voice activity detection to auto-follow the speaking person.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Gimbal Controller uses on-device speech recognition to generate live captions during recording.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
