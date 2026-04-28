@@ -65,8 +65,12 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var gain: Double = 0.3
     @Published var deadZone: Double = 0.05
     @Published var isScanning = false
-    /// True for ~2 s after a confirmed open-palm gesture was detected.
+    /// True while an open-palm gesture is actively guiding the gimbal.
     @Published var palmGestureActive = false
+    /// Synthetic bbox derived from the latest palm position; overrides face bbox in the
+    /// follow loop so the gimbal steers toward whoever is waving their hand.
+    /// Cleared automatically once face detection locks onto the new subject.
+    private var palmGuideBbox: CGRect? = nil
 
     /// All subjects detected in the latest frame; drives the visual overlay.
     @Published var allSubjects: [DetectedSubject] = []
@@ -324,7 +328,9 @@ final class CameraTracker: NSObject, ObservableObject {
                 logTick += 1
                 let shouldLog = (logTick % 15 == 0)
 
-                if let bbox = self.detectedBbox {
+                // Palm guide takes priority over face detection bbox
+                let activeBbox = self.palmGuideBbox ?? self.detectedBbox
+                if let bbox = activeBbox {
                     if self.isScanning {
                         // Mid-scan: require sustained detection before aborting scan
                         self.consecutiveDetections += 1
@@ -934,24 +940,45 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     // MARK: - Palm gesture detection
 
-    /// Accumulates palm observations and fires `startFollow()` after a sustained open palm.
+    /// Updates the palm guide bbox in real-time while an open palm is held up.
+    ///
+    /// While the palm is confirmed the follow loop steers toward the hand position
+    /// instead of the current face bbox, causing the camera to reframe onto the
+    /// person waving their hand.  When the palm drops the guide holds for ~1 s then
+    /// clears; as soon as face detection locks onto the new subject it clears early.
     nonisolated private func processPalmGesture(_ observations: [VNHumanHandPoseObservation]) {
-        let detected = observations.contains { isOpenPalm($0) }
-        if detected {
-            bgPalmFrameCount += 1
-            if bgPalmFrameCount == palmConfirmFrames {
+        guard let palmObs = observations.first(where: { isOpenPalm($0) }),
+              let points = try? palmObs.recognizedPoints(.all),
+              let wrist = points[.wrist], wrist.confidence > 0.5 else {
+            let wasGuiding = bgPalmFrameCount >= palmConfirmFrames
+            bgPalmFrameCount = 0
+            if wasGuiding {
+                // Palm dropped — hold the last aim point briefly then clear
                 Task { @MainActor [weak self] in
-                    guard let self, !self.isFollowing, self.isRunning else { return }
-                    self.palmGestureActive = true
-                    self.startFollow()
-                    Task { [weak self] in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        await MainActor.run { self?.palmGestureActive = false }
-                    }
+                    self?.palmGestureActive = false
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    self?.palmGuideBbox = nil
                 }
             }
-        } else {
-            bgPalmFrameCount = 0
+            return
+        }
+
+        bgPalmFrameCount = min(bgPalmFrameCount + 1, palmConfirmFrames + 1)
+        guard bgPalmFrameCount >= palmConfirmFrames else { return }
+
+        // Build a small synthetic bbox centered on the wrist (palm anchor point).
+        // Vision coords: origin bottom-left, Y increasing upward — same as detectedBbox.
+        let cx = wrist.location.x
+        let cy = wrist.location.y
+        let size: CGFloat = 0.08
+        let synthBbox = CGRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size)
+
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
+            self.palmGuideBbox = synthBbox
+            self.palmGestureActive = true
+            // If follow isn't running, start it so the gimbal actually moves
+            if !self.isFollowing { self.startFollow() }
         }
     }
 
@@ -988,7 +1015,11 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     private func updateBbox(_ box: CGRect?) {
         detectedBbox = box
-        if box != nil { bumpFPS() }
+        if box != nil {
+            // Face detection locked on — release palm guide so normal tracking resumes
+            palmGuideBbox = nil
+            bumpFPS()
+        }
     }
 
     private func bumpFPS() {
