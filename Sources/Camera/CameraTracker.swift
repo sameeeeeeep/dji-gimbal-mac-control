@@ -79,11 +79,14 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var roomSweepState: RoomSweepState = .idle
     /// Persistent map of everyone detected during the initial sweep.
     @Published var subjectMap: [SubjectMapEntry] = []
+    /// Yaw angle the gimbal is currently sweeping toward — drives the splat-map cursor.
+    @Published var sweepCurrentYaw: Double = 0
 
     private var sweepTimer: Timer?
     private var sweepWaypoints: [ScanWaypoint] = []
     private var sweepWaypointIndex: Int = 0
     private var lastSweepWaypointTime: Date?
+    private var autoFollowAfterSweep: Bool = true
     /// Seconds to dwell at each sweep position.
     /// Must be > max gimbal transit time: 160° at ~120°/s ≈ 1.3 s, so 3 s is safe.
     private let sweepDwellTime: TimeInterval = 3.0
@@ -363,40 +366,50 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // MARK: - Room sweep
 
-    /// Sweeps the full yaw range slowly, detects all faces, assigns each a persistent
-    /// speaker number, and records their approximate absolute positions.
-    /// Transitions to follow mode when complete.
-    private func startRoomSweep() {
+    /// Standalone room scan — sweeps the full yaw range, detects all people,
+    /// and builds the splat map. Does NOT auto-start follow when done.
+    /// Works with whatever tracking mode is currently selected (face / person).
+    func scanRoom() {
+        guard isRunning else { return }
+        startRoomSweep(autoFollow: false)
+    }
+
+    /// Internal sweep used by speaker-follow (auto-starts follow when done).
+    private func startRoomSweep(autoFollow: Bool = true) {
         cancelRoomSweep()
-        resetSearchState()  // discard any in-flight serpentine scan
+        resetSearchState()
         subjectMap = []
         faceSlots = []
         nextSpeakerNumber = 1
         voiceNoSpeakerFrames = 0
+        autoFollowAfterSweep = autoFollow
 
         let pos = getCurrentPosition?() ?? GimbalPosition()
-        let pitch = clampPitch(pos.pitch)
 
-        // 5 yaw positions covering the full range, current pitch.
-        // time: 200 = 2000 ms — gives the gimbal up to 2 s to complete each move
-        // (160° at max speed ~120°/s takes ~1.33 s).
-        let yaws: [Double] = [yawMin, yawMin / 2, 0, yawMax / 2, yawMax]
-        sweepWaypoints = yaws.map { y in
-            ScanWaypoint(yaw: y, pitch: pitch, time: 200)
-        }
+        // Two-row serpentine: scan at a slightly-tilted-up row first so faces at
+        // different heights are both covered, then come back across at level.
+        // Each full-width move takes ≤ 1.33 s; time=200 (2 s) is a safe budget.
+        let pitchHigh = clampPitch(pos.pitch + 10)   // slightly up — catches standing people
+        let pitchLow  = clampPitch(pos.pitch - 5)    // slightly down — catches seated people
+        let yawStops: [Double] = [yawMin, yawMin / 2, 0, yawMax / 2, yawMax]
+
+        sweepWaypoints =
+            yawStops.map { y in ScanWaypoint(yaw: y, pitch: pitchHigh, time: 200) } +
+            yawStops.reversed().map { y in ScanWaypoint(yaw: y, pitch: pitchLow,  time: 200) }
+
         sweepWaypointIndex = 0
         lastSweepWaypointTime = nil
         roomSweepState = .sweeping
 
-        // Send first waypoint immediately
         let first = sweepWaypoints[0]
+        sweepCurrentYaw = first.yaw
         onAbsoluteMove?(first.yaw, first.pitch, first.time)
         lastSweepWaypointTime = Date()
 
         sweepTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.sweepTick() }
         }
-        logger.info("SWEEP: starting — \(yaws.count) positions at pitch=\(String(format: "%.0f", pitch))°")
+        logger.info("SWEEP: starting \(self.sweepWaypoints.count)-stop scan, autoFollow=\(autoFollow)")
     }
 
     private func sweepTick() {
@@ -405,36 +418,33 @@ final class CameraTracker: NSObject, ObservableObject {
 
         let elapsed = Date().timeIntervalSince(lastTime)
 
-        // After the gimbal has had time to settle, collect faces on every tick
-        // so we don't miss anyone who was briefly in frame.
         if elapsed >= sweepSettleTime {
             collectFacesForMap()
         }
 
-        guard elapsed >= sweepDwellTime else { return }  // still dwelling
+        guard elapsed >= sweepDwellTime else { return }
 
         sweepWaypointIndex += 1
         if sweepWaypointIndex < sweepWaypoints.count {
             let wp = sweepWaypoints[sweepWaypointIndex]
             onAbsoluteMove?(wp.yaw, wp.pitch, wp.time)
+            sweepCurrentYaw = wp.yaw
             lastSweepWaypointTime = Date()
-            logger.info("SWEEP: → waypoint \(self.sweepWaypointIndex)/\(self.sweepWaypoints.count) yaw=\(String(format: "%.0f", wp.yaw))°")
+            logger.info("SWEEP: → \(self.sweepWaypointIndex)/\(self.sweepWaypoints.count) yaw=\(String(format: "%.0f", wp.yaw))° pitch=\(String(format: "%.0f", wp.pitch))°")
         } else {
             finishRoomSweep()
         }
     }
 
-    /// Snapshot any faces currently in frame and add new ones to the subject map.
+    /// Snapshot any subjects currently in frame and add new ones to the subject map.
     private func collectFacesForMap() {
         guard let pos = getCurrentPosition?() else { return }
         for subject in allSubjects {
-            // Estimate world-space angle: gimbal angle + camera offset from face position
             let faceOffsetYaw   = (Double(subject.bbox.midX) - 0.5) * cameraFOVDeg
             let faceOffsetPitch = (0.5 - Double(subject.bbox.midY)) * (cameraFOVDeg * 0.75)
             let absYaw   = clampYaw(pos.yaw   + faceOffsetYaw)
             let absPitch = clampPitch(pos.pitch + faceOffsetPitch)
 
-            // Skip if this position is within 25° of an existing entry (same person)
             let alreadyMapped = subjectMap.contains { e in
                 let dy = e.approximateYaw   - absYaw
                 let dp = e.approximatePitch - absPitch
@@ -449,22 +459,21 @@ final class CameraTracker: NSObject, ObservableObject {
             )
             subjectMap.append(entry)
             nextSpeakerNumber += 1
-            logger.info("SWEEP: found Speaker \(entry.speakerNumber) at yaw=\(String(format: "%.0f", absYaw))° pitch=\(String(format: "%.0f", absPitch))°")
+            logger.info("SWEEP: mapped person \(entry.speakerNumber) at yaw=\(String(format: "%.0f", absYaw))° pitch=\(String(format: "%.0f", absPitch))°")
         }
     }
 
     private func finishRoomSweep() {
         cancelRoomSweep()
         roomSweepState = .ready
-        logger.info("SWEEP: complete — \(self.subjectMap.count) subject(s) in map")
-        // Pre-seed face slots so visual diarization starts with known speaker numbers
+        logger.info("SWEEP: complete — \(self.subjectMap.count) person(s) mapped")
         faceSlots = subjectMap.map { entry in
             FaceSlot(center: .zero, confidence: 0, speakerNumber: entry.speakerNumber)
         }
-        // Return to center (time=60 → 600 ms transit), then start follow after it arrives
         onAbsoluteMove?(0, 0, 60)
+        guard autoFollowAfterSweep else { return }
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_200_000_000)  // 1.2 s — gimbal reaches center
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
             guard let self, self.isRunning, !self.isFollowing else { return }
             self.startFollow()
         }

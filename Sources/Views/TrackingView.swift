@@ -183,6 +183,11 @@ struct TrackingView: View {
 
             Divider()
 
+            // MARK: Room Scan
+            RoomScanSection(gimbal: gimbal, tracker: tracker)
+
+            Divider()
+
             // MARK: Speaker Follow
             SpeakerFollowSection(tracker: tracker)
 
@@ -222,6 +227,182 @@ private struct LabeledSlider: View {
                 .font(.caption.monospacedDigit())
                 .frame(width: 44, alignment: .trailing)
         }
+    }
+}
+
+// MARK: - Room Scan Section
+
+private struct RoomScanSection: View {
+    @ObservedObject var gimbal: GimbalService
+    @ObservedObject var tracker: CameraTracker
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Room Scan", systemImage: "map")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if tracker.roomSweepState == .sweeping {
+                    HStack(spacing: 4) {
+                        ProgressView().scaleEffect(0.6)
+                        Text("Scanning…").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button("Scan Room") {
+                        tracker.scanRoom()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!tracker.isRunning || !gimbal.state.connectionState.isConnected)
+                }
+            }
+
+            if tracker.roomSweepState != .idle {
+                SplatMapView(
+                    subjects: tracker.subjectMap,
+                    currentYaw: gimbal.state.currentPosition.yaw,
+                    currentPitch: gimbal.state.currentPosition.pitch,
+                    sweepState: tracker.roomSweepState,
+                    sweepCurrentYaw: tracker.sweepCurrentYaw
+                )
+
+                if tracker.roomSweepState == .ready {
+                    if tracker.subjectMap.isEmpty {
+                        Text("No people detected in sweep")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    } else {
+                        HStack(spacing: 12) {
+                            ForEach(tracker.subjectMap) { e in
+                                HStack(spacing: 4) {
+                                    Circle().fill(Color.cyan).frame(width: 6, height: 6)
+                                    Text("P\(e.speakerNumber) \(String(format: "%.0f°", e.approximateYaw))")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button("Clear") {
+                                // re-scan resets; just reset state
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Splat Map
+
+private struct SplatMapView: View {
+    let subjects: [SubjectMapEntry]
+    let currentYaw: Double
+    let currentPitch: Double
+    let sweepState: RoomSweepState
+    let sweepCurrentYaw: Double
+
+    private let yawMin: Double = -160
+    private let yawMax: Double =  160
+    private let pitchMin: Double = -35
+    private let pitchMax: Double =  35
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+
+            ZStack {
+                // Background
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.black.opacity(0.85))
+
+                // Yaw grid + labels
+                ForEach([-160, -90, 0, 90, 160], id: \.self) { deg in
+                    let x = yawX(Double(deg), w: w)
+                    Path { p in
+                        p.move(to: CGPoint(x: x, y: 0))
+                        p.addLine(to: CGPoint(x: x, y: h))
+                    }
+                    .stroke(Color.white.opacity(deg == 0 ? 0.25 : 0.1), lineWidth: 1)
+
+                    Text("\(deg)°")
+                        .font(.system(size: 7))
+                        .foregroundStyle(.white.opacity(0.3))
+                        .position(x: x, y: h - 6)
+                }
+
+                // Pitch=0 horizon line
+                Path { p in
+                    let y = pitchY(0, h: h)
+                    p.move(to: CGPoint(x: 0, y: y))
+                    p.addLine(to: CGPoint(x: w, y: y))
+                }
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+
+                // Sweep cursor
+                if sweepState == .sweeping {
+                    let x = yawX(sweepCurrentYaw, w: w)
+                    Rectangle()
+                        .fill(
+                            LinearGradient(
+                                colors: [.cyan.opacity(0), .cyan.opacity(0.7), .cyan.opacity(0)],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        )
+                        .frame(width: 3, height: h)
+                        .position(x: x, y: h / 2)
+                        .animation(.linear(duration: 0.3), value: sweepCurrentYaw)
+                }
+
+                // Detected people
+                ForEach(subjects) { entry in
+                    let x = yawX(entry.approximateYaw, w: w)
+                    let y = pitchY(entry.approximatePitch, h: h)
+                    ZStack {
+                        Circle()
+                            .fill(Color.cyan.opacity(0.2))
+                            .frame(width: 22, height: 22)
+                        Circle()
+                            .fill(Color.cyan)
+                            .frame(width: 10, height: 10)
+                        Text("\(entry.speakerNumber)")
+                            .font(.system(size: 7, weight: .black))
+                            .foregroundStyle(.black)
+                    }
+                    .position(x: x, y: y)
+                    .transition(.scale.combined(with: .opacity))
+                }
+
+                // Current gimbal position crosshair
+                let cx = yawX(currentYaw, w: w)
+                let cy = pitchY(currentPitch, h: h)
+                Path { p in
+                    p.move(to: CGPoint(x: cx - 7, y: cy)); p.addLine(to: CGPoint(x: cx + 7, y: cy))
+                    p.move(to: CGPoint(x: cx, y: cy - 7)); p.addLine(to: CGPoint(x: cx, y: cy + 7))
+                }
+                .stroke(Color.white.opacity(0.85), lineWidth: 1.5)
+
+                Circle()
+                    .stroke(Color.white.opacity(0.5), lineWidth: 1)
+                    .frame(width: 6, height: 6)
+                    .position(x: cx, y: cy)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(.white.opacity(0.08)))
+            .animation(.easeInOut(duration: 0.3), value: subjects.count)
+        }
+        .frame(height: 90)
+    }
+
+    private func yawX(_ yaw: Double, w: CGFloat) -> CGFloat {
+        CGFloat((yaw - yawMin) / (yawMax - yawMin)) * w
+    }
+
+    private func pitchY(_ pitch: Double, h: CGFloat) -> CGFloat {
+        CGFloat(1 - (pitch - pitchMin) / (pitchMax - pitchMin)) * h
     }
 }
 

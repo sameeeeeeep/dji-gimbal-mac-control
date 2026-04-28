@@ -14,6 +14,8 @@ all:
 	codesign --force --deep --sign - \
 		--entitlements GimbalController.entitlements \
 		$(APP_BUNDLE)
+	mkdir -p ~/Applications
+	cp -R $(APP_BUNDLE) ~/Applications/$(APP_NAME).app
 
 run: all
 	open $(APP_BUNDLE)
