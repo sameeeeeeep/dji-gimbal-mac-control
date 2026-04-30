@@ -971,11 +971,12 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             let wasGuiding = bgPalmFrameCount >= palmConfirmFrames
             bgPalmFrameCount = 0
             if wasGuiding {
-                // Palm dropped — hold the last aim point briefly then clear
+                // Palm dropped — hold the last aim point briefly, then clear both
+                // guide and active flag together so updateBbox can hand off cleanly.
                 Task { @MainActor [weak self] in
-                    self?.palmGestureActive = false
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                     self?.palmGuideBbox = nil
+                    self?.palmGestureActive = false
                 }
             }
             return
@@ -1034,8 +1035,10 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     private func updateBbox(_ box: CGRect?) {
         detectedBbox = box
         if box != nil {
-            // Face detection locked on — release palm guide so normal tracking resumes
-            palmGuideBbox = nil
+            // Only hand off to face detection once the palm gesture has finished.
+            // While palmGestureActive, keep the palm guide alive so speaker-follow's
+            // VAD-driven bbox doesn't immediately override the reframe target.
+            if !palmGestureActive { palmGuideBbox = nil }
             bumpFPS()
         }
     }
