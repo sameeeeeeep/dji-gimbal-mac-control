@@ -43,6 +43,8 @@ struct SubjectMapEntry: Identifiable {
     /// Approximate absolute gimbal angle (degrees) when this person was first detected.
     var approximateYaw: Double
     var approximatePitch: Double
+    /// Optional user-assigned label (e.g. "Alice", "Presenter").
+    var name: String? = nil
 }
 
 enum RoomSweepState {
@@ -87,16 +89,29 @@ final class CameraTracker: NSObject, ObservableObject {
     private var sweepPhaseStart: Date = Date()
     private var sweepLastCollectTime: Date?
 
-    /// Speed-based sweep phases.
-    private enum SweepPhase { case sprintLeft, sweepRight, done }
+    // MARK: Serpentine sweep config
+
+    /// 3-row raster: top row first (standing people), middle, then low (seated).
+    /// direction +1 = sweep right, -1 = sweep left (alternating = serpentine).
+    private let sweepRows: [(pitch: Double, direction: Double)] = [
+        (pitch:  12, direction:  1),   // row 0 – high,  left → right
+        (pitch:   0, direction: -1),   // row 1 – eye,   right → left
+        (pitch: -12, direction:  1),   // row 2 – low,   left → right
+    ]
+    private var sweepCurrentRow: Int = 0
+
+    private enum SweepPhase { case sprintToEdge, tiltToRow, sweepRow, returning, done }
     private var sweepPhase: SweepPhase = .done
 
-    /// Time at max speed to reach the left edge (~160° at max ≈ 120°/s → 1.5 s; 1.8 s is safe).
-    private let sweepSprintDuration: TimeInterval = 1.8
-    /// How long to pan right at slow speed.  At ~15°/s, 320° takes ~21 s.
-    private let sweepAcrossDuration: TimeInterval = 22.0
-    /// Collect a face-map snapshot every N seconds during the slow pan.
-    private let sweepCollectInterval: TimeInterval = 0.4
+    private let sweepSprintDuration: TimeInterval  = 1.8   // fast edge-sprint
+    private let sweepTiltDuration: TimeInterval    = 0.6   // pitch step between rows
+    private let sweepRowDuration: TimeInterval     = 18.0  // slow horizontal scan per row
+    private let sweepCollectInterval: TimeInterval = 0.4   // face-snapshot cadence
+
+    /// Speed constants (speed-unit values sent to the gimbal).
+    private let sweepYawSlow:   Double = 180    // slow pan during scan
+    private let sweepYawFast:   Double = 900    // sprint to edge / return
+    private let sweepPitchFast: Double = 300    // tilt between rows
 
     /// Estimated camera horizontal FOV in degrees (used for world-position estimation).
     private let cameraFOVDeg: Double = 65
@@ -375,8 +390,8 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // MARK: - Room sweep
 
-    /// Standalone room scan. Uses speed commands (not absolute-angle) so it works
-    /// even when the Osmo Mobile ignores position commands.
+    /// Standalone serpentine room scan — 3 pitch rows, full yaw range each,
+    /// returns gimbal to centre when done.
     func scanRoom() {
         guard isRunning else { return }
         startRoomSweep(autoFollow: false)
@@ -390,63 +405,115 @@ final class CameraTracker: NSObject, ObservableObject {
         nextSpeakerNumber = 1
         voiceNoSpeakerFrames = 0
         autoFollowAfterSweep = autoFollow
+        sweepCurrentRow = 0
 
         roomSweepState = .sweeping
-        sweepPhase = .sprintLeft
+        sweepPhase = .sprintToEdge
         sweepPhaseStart = Date()
         sweepLastCollectTime = nil
         sweepCurrentYaw = 0
 
-        // Phase 1: sprint hard-left to reach the left edge
-        onSpeedCommand?(-1000, 0)
+        // Phase 1: sprint hard-left to reach -160° (first row always sweeps right)
+        onSpeedCommand?(-sweepYawFast, 0)
 
         sweepTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.sweepTick() }
         }
-        logger.info("SWEEP: started (speed-based), autoFollow=\(autoFollow)")
+        logger.info("SWEEP: serpentine started — \(self.sweepRows.count) rows, autoFollow=\(autoFollow)")
     }
 
     private func sweepTick() {
         guard roomSweepState == .sweeping else { return }
-
-        // Keep gimbal position data fresh so face-mapping is accurate
-        onRequestPosition?()
+        onRequestPosition?()   // keep position data fresh for face mapping
 
         let now = Date()
         let elapsed = now.timeIntervalSince(sweepPhaseStart)
 
         switch sweepPhase {
-        case .sprintLeft:
+
+        case .sprintToEdge:
+            // Reached left edge — tilt to the first row's pitch
             if elapsed >= sweepSprintDuration {
-                // Left edge reached — start slow rightward pan
-                sweepPhase = .sweepRight
-                sweepPhaseStart = now
-                sweepLastCollectTime = now
-                onSpeedCommand?(200, 0)
-                logger.info("SWEEP: left edge reached, beginning slow sweep right")
+                beginTilt(at: now)
             }
 
-        case .sweepRight:
-            // Update splat-map cursor from live gimbal position
-            if let pos = getCurrentPosition?() {
-                sweepCurrentYaw = pos.yaw
+        case .tiltToRow:
+            if elapsed >= sweepTiltDuration {
+                beginRowSweep(at: now)
             }
 
-            // Snapshot faces every N seconds while panning
+        case .sweepRow:
+            // Live cursor update
+            if let pos = getCurrentPosition?() { sweepCurrentYaw = pos.yaw }
+
+            // Collect faces regularly
             if let last = sweepLastCollectTime,
                now.timeIntervalSince(last) >= sweepCollectInterval {
                 collectFacesForMap()
                 sweepLastCollectTime = now
             }
 
-            if elapsed >= sweepAcrossDuration {
-                onSpeedCommand?(0, 0)   // stop
+            if elapsed >= sweepRowDuration {
+                sweepCurrentRow += 1
+                if sweepCurrentRow < sweepRows.count {
+                    // Tilt to the next row (stop horizontal motion first)
+                    onSpeedCommand?(0, 0)
+                    beginTilt(at: now)
+                } else {
+                    beginReturn(at: now)
+                }
+            }
+
+        case .returning:
+            // Poll position; stop once we're back near centre
+            if let pos = getCurrentPosition?() {
+                if abs(pos.yaw) < 12 && abs(pos.pitch) < 8 {
+                    onSpeedCommand?(0, 0)
+                    finishRoomSweep()
+                }
+            }
+            // Safety timeout — stop after 3 s regardless
+            if elapsed >= 3.0 {
+                onSpeedCommand?(0, 0)
                 finishRoomSweep()
             }
 
         case .done:
             break
         }
+    }
+
+    // MARK: Sweep phase helpers
+
+    private func beginTilt(at now: Date) {
+        sweepPhase = .tiltToRow
+        sweepPhaseStart = now
+        let targetPitch = sweepRows[sweepCurrentRow].pitch
+        // Determine previous pitch so we know which direction to tilt
+        let prevPitch: Double = sweepCurrentRow > 0 ? sweepRows[sweepCurrentRow - 1].pitch : 0
+        let pitchSpeed = targetPitch > prevPitch ? sweepPitchFast : -sweepPitchFast
+        onSpeedCommand?(0, pitchSpeed)
+        logger.info("SWEEP: tilting to row \(self.sweepCurrentRow) (pitch \(String(format: "%.0f", targetPitch))°)")
+    }
+
+    private func beginRowSweep(at now: Date) {
+        sweepPhase = .sweepRow
+        sweepPhaseStart = now
+        sweepLastCollectTime = now
+        let row = sweepRows[sweepCurrentRow]
+        onSpeedCommand?(row.direction * sweepYawSlow, 0)
+        logger.info("SWEEP: row \(self.sweepCurrentRow) — pitch \(String(format: "%.0f", row.pitch))°, dir \(row.direction > 0 ? "→" : "←")")
+    }
+
+    private func beginReturn(at now: Date) {
+        sweepPhase = .returning
+        sweepPhaseStart = now
+        let pos = getCurrentPosition?() ?? GimbalPosition()
+        // Sprint back toward yaw=0 and pitch=0 simultaneously
+        let yawSpeed   = pos.yaw   > 0 ? -sweepYawFast   :  sweepYawFast
+        let pitchSpeed = pos.pitch < 0 ?  sweepPitchFast : -sweepPitchFast
+        onSpeedCommand?(yawSpeed, pitchSpeed)
+        logger.info("SWEEP: returning to centre from yaw=\(String(format: "%.0f", pos.yaw))° pitch=\(String(format: "%.0f", pos.pitch))°")
     }
 
     /// Snapshot any subjects currently in frame and add new ones to the subject map.
@@ -493,7 +560,8 @@ final class CameraTracker: NSObject, ObservableObject {
     private func cancelRoomSweep() {
         sweepTimer?.invalidate()
         sweepTimer = nil
-        onSpeedCommand?(0, 0)   // ensure gimbal stops if scan is aborted
+        sweepPhase = .done
+        onSpeedCommand?(0, 0)
         if roomSweepState == .sweeping { roomSweepState = .idle }
     }
 

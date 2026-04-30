@@ -238,6 +238,7 @@ private struct RoomScanSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            // Header + scan button
             HStack {
                 Label("Room Scan", systemImage: "map")
                     .font(.caption.weight(.semibold))
@@ -249,7 +250,7 @@ private struct RoomScanSection: View {
                         Text("Scanning…").font(.caption).foregroundStyle(.secondary)
                     }
                 } else {
-                    Button("Scan Room") {
+                    Button(tracker.roomSweepState == .ready ? "Re-scan" : "Scan Room") {
                         tracker.scanRoom()
                     }
                     .buttonStyle(.bordered)
@@ -259,6 +260,7 @@ private struct RoomScanSection: View {
             }
 
             if tracker.roomSweepState != .idle {
+                // Splat map
                 SplatMapView(
                     subjects: tracker.subjectMap,
                     currentYaw: gimbal.state.currentPosition.yaw,
@@ -267,31 +269,55 @@ private struct RoomScanSection: View {
                     sweepCurrentYaw: tracker.sweepCurrentYaw
                 )
 
+                // Results + tagging
                 if tracker.roomSweepState == .ready {
                     if tracker.subjectMap.isEmpty {
-                        Text("No people detected in sweep")
+                        Text("No people detected — try again with better lighting")
                             .font(.caption2).foregroundStyle(.tertiary)
                     } else {
-                        HStack(spacing: 12) {
-                            ForEach(tracker.subjectMap) { e in
-                                HStack(spacing: 4) {
-                                    Circle().fill(Color.cyan).frame(width: 6, height: 6)
-                                    Text("P\(e.speakerNumber) \(String(format: "%.0f°", e.approximateYaw))")
-                                        .font(.caption2).foregroundStyle(.secondary)
-                                }
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(tracker.subjectMap.indices, id: \.self) { idx in
+                                PersonTagRow(
+                                    entry: tracker.subjectMap[idx],
+                                    onNameChange: { newName in
+                                        tracker.subjectMap[idx].name = newName.isEmpty ? nil : newName
+                                    }
+                                )
                             }
-                            Spacer()
-                            Button("Clear") {
-                                // re-scan resets; just reset state
-                            }
-                            .font(.caption2)
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.tertiary)
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// A single row in the post-scan tagging list.
+private struct PersonTagRow: View {
+    let entry: SubjectMapEntry
+    let onNameChange: (String) -> Void
+    @State private var nameText: String = ""
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Coloured index badge
+            ZStack {
+                Circle().fill(Color.cyan.opacity(0.25)).frame(width: 18, height: 18)
+                Text("\(entry.speakerNumber)")
+                    .font(.system(size: 9, weight: .black))
+                    .foregroundStyle(.cyan)
+            }
+            Text(String(format: "%.0f°, %.0f°", entry.approximateYaw, entry.approximatePitch))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 68, alignment: .leading)
+            TextField("Name…", text: $nameText)
+                .font(.caption)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { onNameChange(nameText) }
+                .onChange(of: nameText) { _, v in onNameChange(v) }
+        }
+        .onAppear { nameText = entry.name ?? "" }
     }
 }
 
@@ -361,16 +387,30 @@ private struct SplatMapView: View {
                 ForEach(subjects) { entry in
                     let x = yawX(entry.approximateYaw, w: w)
                     let y = pitchY(entry.approximatePitch, h: h)
-                    ZStack {
-                        Circle()
-                            .fill(Color.cyan.opacity(0.2))
-                            .frame(width: 22, height: 22)
-                        Circle()
-                            .fill(Color.cyan)
-                            .frame(width: 10, height: 10)
-                        Text("\(entry.speakerNumber)")
-                            .font(.system(size: 7, weight: .black))
-                            .foregroundStyle(.black)
+                    let label = entry.name ?? "\(entry.speakerNumber)"
+                    ZStack(alignment: .bottom) {
+                        // Dot
+                        ZStack {
+                            Circle()
+                                .fill(Color.cyan.opacity(0.2))
+                                .frame(width: 22, height: 22)
+                            Circle()
+                                .fill(Color.cyan)
+                                .frame(width: 10, height: 10)
+                            Text("\(entry.speakerNumber)")
+                                .font(.system(size: 7, weight: .black))
+                                .foregroundStyle(.black)
+                        }
+                        // Name tag below dot (visible when name is assigned)
+                        if entry.name != nil {
+                            Text(label)
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(.black.opacity(0.7), in: Capsule())
+                                .offset(y: 18)
+                        }
                     }
                     .position(x: x, y: y)
                     .transition(.scale.combined(with: .opacity))
