@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import SceneKit
 
 struct TrackingView: View {
     @ObservedObject var gimbal: GimbalService
@@ -235,19 +236,37 @@ private struct LabeledSlider: View {
 private struct RoomScanSection: View {
     @ObservedObject var gimbal: GimbalService
     @ObservedObject var tracker: CameraTracker
+    @ObservedObject private var panorama: PanoramaBuilder
+
+    init(gimbal: GimbalService, tracker: CameraTracker) {
+        self.gimbal = gimbal
+        self.tracker = tracker
+        self.panorama = tracker.panoramaBuilder
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Header + scan button
+            // ── Header ───────────────────────────────────────────────────────
             HStack {
                 Label("Room Scan", systemImage: "map")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if tracker.roomSweepState == .sweeping {
+
+                if tracker.isNavigating {
                     HStack(spacing: 4) {
                         ProgressView().scaleEffect(0.6)
-                        Text("Scanning…").font(.caption).foregroundStyle(.secondary)
+                        Text("Navigating…").font(.caption).foregroundStyle(.cyan)
+                    }
+                } else if tracker.roomSweepState == .sweeping {
+                    HStack(spacing: 4) {
+                        ProgressView().scaleEffect(0.6)
+                        Text("Scanning room…").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if panorama.isBuilding {
+                    HStack(spacing: 4) {
+                        ProgressView().scaleEffect(0.6)
+                        Text("Building panorama…").font(.caption).foregroundStyle(.secondary)
                     }
                 } else {
                     Button(tracker.roomSweepState == .ready ? "Re-scan" : "Scan Room") {
@@ -259,8 +278,8 @@ private struct RoomScanSection: View {
                 }
             }
 
-            if tracker.roomSweepState != .idle {
-                // Splat map
+            // ── During sweep: flat 2D progress map ───────────────────────────
+            if tracker.roomSweepState == .sweeping {
                 SplatMapView(
                     subjects: tracker.subjectMap,
                     currentYaw: gimbal.state.currentPosition.yaw,
@@ -268,22 +287,66 @@ private struct RoomScanSection: View {
                     sweepState: tracker.roomSweepState,
                     sweepCurrentYaw: tracker.sweepCurrentYaw
                 )
+                Text("5-row serpentine scan in progress")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
 
-                // Results + tagging
-                if tracker.roomSweepState == .ready {
-                    if tracker.subjectMap.isEmpty {
-                        Text("No people detected — try again with better lighting")
-                            .font(.caption2).foregroundStyle(.tertiary)
-                    } else {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(tracker.subjectMap.indices, id: \.self) { idx in
-                                PersonTagRow(
-                                    entry: tracker.subjectMap[idx],
-                                    onNameChange: { newName in
-                                        tracker.subjectMap[idx].name = newName.isEmpty ? nil : newName
-                                    }
-                                )
-                            }
+            // ── After sweep: panorama sphere + people list ────────────────────
+            if tracker.roomSweepState == .ready {
+                if let pano = panorama.panorama {
+                    // Interactive 360° sphere
+                    PanoramaSphereView(
+                        panorama: pano,
+                        subjects: tracker.subjectMap,
+                        onTapSubject: { entry in
+                            tracker.navigateTo(
+                                yaw:   entry.approximateYaw,
+                                pitch: entry.approximatePitch)
+                        }
+                    )
+                    .frame(height: 220)
+                    .cornerRadius(8)
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.1)))
+
+                    Text("Drag to look around  •  Click a dot to send gimbal there")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                } else if panorama.isBuilding {
+                    PanoramaBuildingView()
+                } else {
+                    // Scan done but no panorama (camera wasn't running)
+                    SplatMapView(
+                        subjects: tracker.subjectMap,
+                        currentYaw: gimbal.state.currentPosition.yaw,
+                        currentPitch: gimbal.state.currentPosition.pitch,
+                        sweepState: tracker.roomSweepState,
+                        sweepCurrentYaw: tracker.sweepCurrentYaw,
+                        onTapSubject: { entry in
+                            tracker.navigateTo(
+                                yaw:   entry.approximateYaw,
+                                pitch: entry.approximatePitch)
+                        }
+                    )
+                }
+
+                // People list + name tags
+                if tracker.subjectMap.isEmpty {
+                    Text("No people detected — try again with better lighting")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(tracker.subjectMap.indices, id: \.self) { idx in
+                            PersonTagRow(
+                                entry: tracker.subjectMap[idx],
+                                onTap: {
+                                    tracker.navigateTo(
+                                        yaw:   tracker.subjectMap[idx].approximateYaw,
+                                        pitch: tracker.subjectMap[idx].approximatePitch)
+                                },
+                                onNameChange: { newName in
+                                    tracker.subjectMap[idx].name = newName.isEmpty ? nil : newName
+                                }
+                            )
                         }
                     }
                 }
@@ -295,18 +358,24 @@ private struct RoomScanSection: View {
 /// A single row in the post-scan tagging list.
 private struct PersonTagRow: View {
     let entry: SubjectMapEntry
+    let onTap: () -> Void
     let onNameChange: (String) -> Void
     @State private var nameText: String = ""
 
     var body: some View {
         HStack(spacing: 6) {
-            // Coloured index badge
-            ZStack {
-                Circle().fill(Color.cyan.opacity(0.25)).frame(width: 18, height: 18)
-                Text("\(entry.speakerNumber)")
-                    .font(.system(size: 9, weight: .black))
-                    .foregroundStyle(.cyan)
+            // Badge — tappable to navigate gimbal
+            Button(action: onTap) {
+                ZStack {
+                    Circle().fill(Color.cyan.opacity(0.25)).frame(width: 18, height: 18)
+                    Text("\(entry.speakerNumber)")
+                        .font(.system(size: 9, weight: .black))
+                        .foregroundStyle(.cyan)
+                }
             }
+            .buttonStyle(.plain)
+            .help("Click to point gimbal here")
+
             Text(String(format: "%.0f°, %.0f°", entry.approximateYaw, entry.approximatePitch))
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -329,6 +398,7 @@ private struct SplatMapView: View {
     let currentPitch: Double
     let sweepState: RoomSweepState
     let sweepCurrentYaw: Double
+    var onTapSubject: ((SubjectMapEntry) -> Void)? = nil
 
     private let yawMin: Double = -160
     private let yawMax: Double =  160
@@ -414,6 +484,8 @@ private struct SplatMapView: View {
                     }
                     .position(x: x, y: y)
                     .transition(.scale.combined(with: .opacity))
+                    .onTapGesture { onTapSubject?(entry) }
+                    .help("Tap to navigate gimbal here")
                 }
 
                 // Current gimbal position crosshair

@@ -84,6 +84,23 @@ final class CameraTracker: NSObject, ObservableObject {
     /// Yaw angle the gimbal is currently sweeping toward — drives the splat-map cursor.
     @Published var sweepCurrentYaw: Double = 0
 
+    // MARK: - Panorama
+    let panoramaBuilder = PanoramaBuilder()
+    /// Frames captured during the most recent sweep (MainActor-only).
+    private var capturedScanFrames: [CapturedFrame] = []
+    /// Last pixel buffer from the camera (written on camera queue, read on MainActor).
+    nonisolated(unsafe) private var latestPixelBuffer: CVPixelBuffer? = nil
+    /// Shared CIContext for efficient frame-to-CGImage conversion.
+    nonisolated(unsafe) private let ciCtxCapture = CIContext(options: [.useSoftwareRenderer: false])
+
+    // MARK: - Point-and-go navigation
+    /// True while a tap-to-navigate move is in progress.
+    @Published var isNavigating: Bool = false
+    private var navTarget: (yaw: Double, pitch: Double)? = nil
+    private var navTimer: Timer? = nil
+    /// Degrees within target before we declare arrival.
+    private let navArrivalDeg: Double = 8.0
+
     private var sweepTimer: Timer?
     private var autoFollowAfterSweep: Bool = true
     private var sweepPhaseStart: Date = Date()
@@ -91,12 +108,14 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // MARK: Serpentine sweep config
 
-    /// 3-row raster: top row first (standing people), middle, then low (seated).
-    /// direction +1 = sweep right, -1 = sweep left (alternating = serpentine).
+    /// 5-row spherical raster: top → bottom, alternating direction.
+    /// Covers ±28° pitch at 14° spacing for full room height (standing + seated).
     private let sweepRows: [(pitch: Double, direction: Double)] = [
-        (pitch:  12, direction:  1),   // row 0 – high,  left → right
-        (pitch:   0, direction: -1),   // row 1 – eye,   right → left
-        (pitch: -12, direction:  1),   // row 2 – low,   left → right
+        (pitch:  28, direction:  1),   // row 0 – high,       left → right
+        (pitch:  14, direction: -1),   // row 1 – upper-mid,  right → left
+        (pitch:   0, direction:  1),   // row 2 – eye,        left → right
+        (pitch: -14, direction: -1),   // row 3 – lower-mid,  right → left
+        (pitch: -28, direction:  1),   // row 4 – low,        left → right
     ]
     private var sweepCurrentRow: Int = 0
 
@@ -104,9 +123,9 @@ final class CameraTracker: NSObject, ObservableObject {
     private var sweepPhase: SweepPhase = .done
 
     private let sweepSprintDuration: TimeInterval  = 1.8   // fast edge-sprint
-    private let sweepTiltDuration: TimeInterval    = 0.6   // pitch step between rows
-    private let sweepRowDuration: TimeInterval     = 18.0  // slow horizontal scan per row
-    private let sweepCollectInterval: TimeInterval = 0.4   // face-snapshot cadence
+    private let sweepTiltDuration: TimeInterval    = 0.8   // pitch step between rows
+    private let sweepRowDuration: TimeInterval     = 16.0  // slow horizontal scan per row
+    private let sweepCollectInterval: TimeInterval = 0.35  // frame capture cadence
 
     /// Speed constants (speed-unit values sent to the gimbal).
     private let sweepYawSlow:   Double = 180    // slow pan during scan
@@ -350,8 +369,9 @@ final class CameraTracker: NSObject, ObservableObject {
         followTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                // Room sweep has exclusive gimbal control — don't compete with it
+                // Room sweep and point-and-go navigation have exclusive gimbal control
                 guard self.roomSweepState != .sweeping else { return }
+                guard !self.isNavigating else { return }
                 logTick += 1
                 let shouldLog = (logTick % 15 == 0)
 
@@ -386,6 +406,49 @@ final class CameraTracker: NSObject, ObservableObject {
         smoothedYaw = 0
         smoothedPitch = 0
         onSpeedCommand?(0, 0)
+        stopNavigation()
+    }
+
+    // MARK: - Point-and-go navigation
+
+    /// Navigate gimbal to the given absolute (yaw, pitch) using speed commands,
+    /// polling the current position every 100 ms until arrival.
+    func navigateTo(yaw: Double, pitch: Double) {
+        stopNavigation()
+        navTarget = (yaw: yaw, pitch: pitch)
+        isNavigating = true
+        navTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.navTick() }
+        }
+        onRequestPosition?()
+        logger.info("NAV: → yaw=\(String(format: "%.0f", yaw))° pitch=\(String(format: "%.0f", pitch))°")
+    }
+
+    private func navTick() {
+        guard let target = navTarget,
+              let pos = getCurrentPosition?() else { return }
+        onRequestPosition?()
+
+        let dyaw   = target.yaw   - pos.yaw
+        let dpitch = target.pitch - pos.pitch
+
+        if abs(dyaw) < navArrivalDeg && abs(dpitch) < navArrivalDeg {
+            onSpeedCommand?(0, 0)
+            stopNavigation()
+            logger.info("NAV: arrived")
+            return
+        }
+
+        let yawSpeed   = abs(dyaw)   < navArrivalDeg ? 0.0 : (dyaw   > 0 ? sweepYawFast   : -sweepYawFast)
+        let pitchSpeed = abs(dpitch) < navArrivalDeg ? 0.0 : (dpitch > 0 ? sweepPitchFast : -sweepPitchFast)
+        onSpeedCommand?(yawSpeed, pitchSpeed)
+    }
+
+    private func stopNavigation() {
+        navTimer?.invalidate()
+        navTimer = nil
+        navTarget = nil
+        isNavigating = false
     }
 
     // MARK: - Room sweep
@@ -401,6 +464,7 @@ final class CameraTracker: NSObject, ObservableObject {
         cancelRoomSweep()
         resetSearchState()
         subjectMap = []
+        capturedScanFrames = []
         faceSlots = []
         nextSpeakerNumber = 1
         voiceNoSpeakerFrames = 0
@@ -516,21 +580,28 @@ final class CameraTracker: NSObject, ObservableObject {
         logger.info("SWEEP: returning to centre from yaw=\(String(format: "%.0f", pos.yaw))° pitch=\(String(format: "%.0f", pos.pitch))°")
     }
 
-    /// Snapshot any subjects currently in frame and add new ones to the subject map.
+    /// Snapshot any subjects currently in frame: update the subject map + capture a frame for panorama.
     private func collectFacesForMap() {
         guard let pos = getCurrentPosition?() else { return }
+
+        // ── Face map ──────────────────────────────────────────────────────────
         for subject in allSubjects {
             let faceOffsetYaw   = (Double(subject.bbox.midX) - 0.5) * cameraFOVDeg
             let faceOffsetPitch = (0.5 - Double(subject.bbox.midY)) * (cameraFOVDeg * 0.75)
             let absYaw   = clampYaw(pos.yaw   + faceOffsetYaw)
             let absPitch = clampPitch(pos.pitch + faceOffsetPitch)
 
-            let alreadyMapped = subjectMap.contains { e in
-                let dy = e.approximateYaw - absYaw
+            // Merge radius 40° — same person detected across multiple rows averages into one dot.
+            if let idx = subjectMap.firstIndex(where: { e in
+                let dy = e.approximateYaw   - absYaw
                 let dp = e.approximatePitch - absPitch
-                return (dy * dy + dp * dp) < 25 * 25
+                return (dy * dy + dp * dp) < 40 * 40
+            }) {
+                // Refine position with weighted running average (70% old, 30% new detection)
+                subjectMap[idx].approximateYaw   = 0.7 * subjectMap[idx].approximateYaw   + 0.3 * absYaw
+                subjectMap[idx].approximatePitch = 0.7 * subjectMap[idx].approximatePitch + 0.3 * absPitch
+                continue
             }
-            guard !alreadyMapped else { continue }
 
             let entry = SubjectMapEntry(
                 speakerNumber: nextSpeakerNumber,
@@ -541,13 +612,45 @@ final class CameraTracker: NSObject, ObservableObject {
             nextSpeakerNumber += 1
             logger.info("SWEEP: person \(entry.speakerNumber) at yaw=\(String(format: "%.0f", absYaw))° pitch=\(String(format: "%.0f", absPitch))°")
         }
+
+        // ── Panorama frame capture ─────────────────────────────────────────────
+        captureFrameForPanorama(yaw: pos.yaw, pitch: pos.pitch)
+    }
+
+    /// Convert the latest camera frame to a small CGImage and append it to the panorama buffer.
+    /// Runs on MainActor; conversion dispatched off-thread to avoid blocking.
+    private func captureFrameForPanorama(yaw: Double, pitch: Double) {
+        guard let pb = latestPixelBuffer else { return }
+
+        // Hold onto local copies for the detached task (CVPixelBuffer is a CF object, safe to retain)
+        let localBuffer  = pb
+        let localContext = ciCtxCapture
+
+        Task.detached(priority: .utility) { [weak self] in
+            let ci    = CIImage(cvPixelBuffer: localBuffer)
+            // Downsample to ~480px wide — enough for panorama stitching, small enough to be fast
+            let scale = min(1.0, 480.0 / ci.extent.width)
+            let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            guard let cg = localContext.createCGImage(small, from: small.extent) else { return }
+            let frame = CapturedFrame(image: cg, yaw: yaw, pitch: pitch)
+            await MainActor.run { [weak self] in
+                self?.capturedScanFrames.append(frame)
+            }
+        }
     }
 
     private func finishRoomSweep() {
         sweepPhase = .done
         cancelRoomSweep()
         roomSweepState = .ready
-        logger.info("SWEEP: complete — \(self.subjectMap.count) person(s) mapped")
+        logger.info("SWEEP: complete — \(self.subjectMap.count) person(s) mapped, \(self.capturedScanFrames.count) frames captured")
+
+        // Build panorama from all captured frames
+        let frames = capturedScanFrames
+        if !frames.isEmpty {
+            panoramaBuilder.build(from: frames)
+        }
+
         faceSlots = subjectMap.map { FaceSlot(center: .zero, confidence: 0, speakerNumber: $0.speakerNumber) }
         guard autoFollowAfterSweep else { return }
         Task { @MainActor [weak self] in
@@ -562,6 +665,7 @@ final class CameraTracker: NSObject, ObservableObject {
         sweepTimer = nil
         sweepPhase = .done
         onSpeedCommand?(0, 0)
+        stopNavigation()
         if roomSweepState == .sweeping { roomSweepState = .idle }
     }
 
@@ -846,6 +950,8 @@ extension CameraTracker: AVCaptureFileOutputRecordingDelegate {
 extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // Store for panorama frame capture (read on MainActor in collectFacesForMap)
+        latestPixelBuffer = pixelBuffer
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
 
         // Hand pose runs in every mode so open-palm gesture always works
