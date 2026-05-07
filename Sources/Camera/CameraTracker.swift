@@ -125,12 +125,12 @@ final class CameraTracker: NSObject, ObservableObject {
     private enum SweepPhase { case sprintToStart, sweepColumn, stepToNextColumn, returning, done }
     private var sweepPhase: SweepPhase = .done
 
-    /// Wait after absolute-angle sprint to first column (transition time = 1.5 s + margin).
-    private let sweepSprintDuration:     TimeInterval = 2.5
+    /// Wait after speed-command sprint to first column.
+    private let sweepSprintDuration:     TimeInterval = 2.0
     /// Time to tilt through the full ±28° pitch range.
     private let sweepColumnDuration:     TimeInterval = 5.5
-    /// Wait after absolute-angle step to next column (45° yaw = ~400 ms + margin).
-    private let sweepColumnStepDuration: TimeInterval = 1.2
+    /// Wait after speed-command step to next column (45° at sweepYawFast).
+    private let sweepColumnStepDuration: TimeInterval = 0.6
     private let sweepCollectInterval:    TimeInterval = 0.35  // frame capture cadence
 
     /// Speed constants used only for the slow column pitch sweep.
@@ -501,8 +501,8 @@ final class CameraTracker: NSObject, ObservableObject {
         deadReckonYaw   = sweepColumnYaws[0]
         deadReckonPitch = sweepPitchTop
 
-        // Absolute move to first column, top pitch — 1.5 s transition (time=150 → 1500 ms)
-        onAbsoluteMove?(sweepColumnYaws[0], sweepPitchTop, 150)
+        // Speed command to sprint to top-left corner
+        onSpeedCommand?(-sweepYawFast, sweepPitchFast)
 
         sweepTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.sweepTick() }
@@ -555,8 +555,14 @@ final class CameraTracker: NSObject, ObservableObject {
             }
 
         case .returning:
-            // Wait for the 2 s absolute-angle move to complete, then finish
-            if elapsed >= 2.5 {
+            if let pos = getCurrentPosition?() {
+                if abs(pos.yaw) < 12 && abs(pos.pitch) < 8 {
+                    onSpeedCommand?(0, 0)
+                    finishRoomSweep()
+                }
+            }
+            if elapsed >= 3.0 {
+                onSpeedCommand?(0, 0)
                 finishRoomSweep()
             }
 
@@ -584,21 +590,18 @@ final class CameraTracker: NSObject, ObservableObject {
     private func beginColumnStep(at now: Date) {
         sweepPhase = .stepToNextColumn
         sweepPhaseStart = now
-        let nextYaw = sweepColumnYaws[min(sweepCurrentCol, sweepColumnYaws.count - 1)]
-        // Keep the same pitch we're at (the next column starts from this end).
-        // Even columns finish at bottom; odd finish at top — absolute move stays there.
-        let curPitch = sweepCurrentCol % 2 == 1 ? sweepPitchBottom : sweepPitchTop
-        // Absolute move: 45° yaw step, time=50 (500 ms)
-        onAbsoluteMove?(nextYaw, curPitch, 50)
-        logger.info("SWEEP: stepping to column \(self.sweepCurrentCol) yaw=\(String(format: "%.0f", nextYaw))°")
+        onSpeedCommand?(sweepYawFast, 0)
+        logger.info("SWEEP: stepping to column \(self.sweepCurrentCol)")
     }
 
     private func beginReturn(at now: Date) {
         sweepPhase = .returning
         sweepPhaseStart = now
-        // Absolute move to centre — 2 s transition (time=200)
-        onAbsoluteMove?(0, 0, 200)
-        logger.info("SWEEP: returning to centre")
+        let pos = getCurrentPosition?() ?? GimbalPosition()
+        let yawSpeed   = pos.yaw   > 0 ? -sweepYawFast   :  sweepYawFast
+        let pitchSpeed = pos.pitch < 0 ?  sweepPitchFast : -sweepPitchFast
+        onSpeedCommand?(yawSpeed, pitchSpeed)
+        logger.info("SWEEP: returning to centre from yaw=\(String(format: "%.0f", pos.yaw))° pitch=\(String(format: "%.0f", pos.pitch))°")
     }
 
     /// Snapshot any subjects currently in frame: update the subject map + capture a frame for panorama.
@@ -708,6 +711,12 @@ final class CameraTracker: NSObject, ObservableObject {
                 }
                 let faceSlotsCopy = self.subjectMap.map { FaceSlot(center: .zero, confidence: 0, speakerNumber: $0.speakerNumber) }
                 self.faceSlots = faceSlotsCopy
+
+                // Auto-start journal after scan completes
+                if !self.journalAnalyzer.isAnalyzing {
+                    self.journalAnalyzer.start(tracker: self, transcriber: self.transcriber)
+                }
+
                 guard self.autoFollowAfterSweep else { return }
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 800_000_000)

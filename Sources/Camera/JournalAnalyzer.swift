@@ -5,12 +5,11 @@ import os
 
 // MARK: - Data model
 
-/// A single sentence appended to the running narrative when a scene change is detected.
 struct NarrativeBeat: Identifiable {
     let id        = UUID()
     let timestamp = Date()
     let sentence: String
-    let trigger:  String   // what change caused it (for debug / tooltips)
+    let trigger:  String
 }
 
 /// Vision-derived snapshot of a single camera frame.
@@ -18,16 +17,33 @@ struct SceneObservation {
     let timestamp: Date
     let sceneLabels: [(label: String, confidence: Float)]
     let visibleText: [String]
-    let faceCount: Int
-    let activityHints: [String]   // "standing" | "seated"
+    let subjects: [DetectedSubject]   // from CameraTracker — positioned, speaker-labelled
+    let faceCount: Int                // fallback when tracker subjects unavailable
+    let bodyActivities: [String]      // per-person: "standing", "seated", "arms raised", etc.
+    let handGestures: [String]        // per-hand: "open palm", "pointing", "thumbs up", "fist"
 
     var oneLiner: String {
         var parts: [String] = []
-        if !sceneLabels.isEmpty {
-            parts.append(sceneLabels.prefix(3).map { $0.label }.joined(separator: ", "))
+
+        // Describe people by screen position if we have subject data
+        if !subjects.isEmpty {
+            let descs = subjects.prefix(3).map { s -> String in
+                let side = s.bbox.midX < 0.35 ? "left" :
+                           s.bbox.midX > 0.65 ? "right" : "center"
+                let label = s.speakerLabel ?? "person"
+                return "\(label) (\(side))"
+            }
+            parts.append(descs.joined(separator: ", "))
+        } else if faceCount > 0 {
+            parts.append("\(faceCount) person\(faceCount == 1 ? "" : "s")")
         }
-        if faceCount > 0 { parts.append("\(faceCount) person\(faceCount == 1 ? "" : "s")") }
-        if let act = activityHints.first { parts.append(act) }
+
+        if !bodyActivities.isEmpty { parts.append(bodyActivities.prefix(2).joined(separator: ", ")) }
+        if !handGestures.isEmpty   { parts.append(handGestures.joined(separator: ", ")) }
+
+        if !sceneLabels.isEmpty {
+            parts.append(sceneLabels.prefix(2).map { $0.label }.joined(separator: ", "))
+        }
         if !visibleText.isEmpty { parts.append("\"\(visibleText[0])\"") }
         return parts.joined(separator: " · ")
     }
@@ -35,61 +51,38 @@ struct SceneObservation {
 
 // MARK: - JournalAnalyzer
 
-/// Real-time continuous narrative journal, optimised for M1 Air 8 GB.
-///
-/// Architecture:
-///   • Apple Vision (ANE, ~10 ms/frame, always free) — continuous per-frame structure
-///   • MLX Qwen2.5-1.5B (~60 tokens ≈ 2 s on M1 Air) — one sentence per scene change
-///
-/// Every detected change (person enters/leaves, activity shifts, new text on screen)
-/// triggers a single-sentence continuation of a running narrative thread.
-/// The model receives the last 4 sentences as context so the prose stays coherent.
-/// No fixed timer, no batch chunks — the story builds itself in real time.
 @MainActor
 final class JournalAnalyzer: ObservableObject {
 
-    // MARK: - MLX runner (owned here)
     let runner = MLXRunner()
 
-    // MARK: - Published state
-
-    /// Ordered beats that make up the running narrative.
     @Published var beats: [NarrativeBeat] = []
-    /// Full narrative text — the concatenation of all beat sentences.
     @Published var narrative = ""
     @Published var isAnalyzing    = false
     @Published var modelStatus    = "Idle"
     @Published var currentSessionPath: URL? = nil
     @Published var latestObservation: SceneObservation? = nil
-    /// True while a sentence is being generated (shows spinner in UI).
     @Published var isWriting = false
 
-    // MARK: - Config
-
-    var frameInterval: TimeInterval = 2.0    // 0.5 fps Vision sampling
-    /// Minimum gap between narrative additions — keeps M1 Air cool.
-    var writeCooldown: TimeInterval = 15.0
-
-    // MARK: - Private
+    var frameInterval: TimeInterval = 3.0
+    var writeCooldown: TimeInterval = 20.0
 
     private weak var tracker:    CameraTracker?
     private weak var transcriber: WhisperTranscriber?
-
     private var captureTimer: Timer?
 
     private let visionQueue = DispatchQueue(label: "com.gimbal.vision", qos: .utility)
     private var visionBusy  = false
 
-    // Change detection
-    private var prevFaceCount   = -1
-    private var prevActivity    = ""
-    private var prevOCRSnapshot = Set<String>()
-    private var lastWriteTime   = Date.distantPast
+    // Change detection state
+    private var prevFaceCount     = -1
+    private var prevBodyActivity  = ""
+    private var prevHandGestures  = Set<String>()
+    private var prevOCRSnapshot   = Set<String>()
+    private var lastWriteTime     = Date.distantPast
 
     private var sessionStart = Date()
     private let logger = Logger(subsystem: "com.gimbal.controller", category: "JournalAnalyzer")
-
-    // MARK: - Journal directory
 
     var journalDir: URL {
         gimbalCapturesDir.appendingPathComponent("Journal", isDirectory: true)
@@ -103,7 +96,8 @@ final class JournalAnalyzer: ObservableObject {
         self.transcriber = transcriber
         sessionStart     = Date()
         prevFaceCount    = -1
-        prevActivity     = ""
+        prevBodyActivity = ""
+        prevHandGestures = []
         prevOCRSnapshot  = []
         lastWriteTime    = .distantPast
         isAnalyzing      = true
@@ -117,9 +111,7 @@ final class JournalAnalyzer: ObservableObject {
         captureTimer = Timer.scheduledTimer(withTimeInterval: frameInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.captureAndObserve() }
         }
-
         modelStatus = runner.isReady ? "Running" : "Waiting for MLX…"
-        logger.info("JournalAnalyzer started")
     }
 
     func stop() {
@@ -136,53 +128,66 @@ final class JournalAnalyzer: ObservableObject {
         guard !visionBusy else { return }
         visionBusy = true
 
+        // Capture subject positions on MainActor before going to the background queue
+        let subjects = tracker.allSubjects
+
         visionQueue.async { [weak self] in
-            let obs = Self.runVisionSync(on: image)
+            let obs = Self.runVisionSync(on: image, subjects: subjects)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.visionBusy      = false
+                self.visionBusy        = false
                 self.latestObservation = obs
                 self.detectChange(obs)
             }
         }
     }
 
-    // MARK: - Change detection → narrative continuation
+    // MARK: - Change detection
 
     private func detectChange(_ obs: SceneObservation) {
         guard runner.isReady, !isWriting else { return }
         guard Date().timeIntervalSince(lastWriteTime) >= writeCooldown else { return }
 
-        var changeDesc: String? = nil
+        var changes: [String] = []
 
-        if prevFaceCount >= 0, obs.faceCount != prevFaceCount {
-            let delta = obs.faceCount - prevFaceCount
-            changeDesc = delta > 0
+        // Person count change
+        let faceCount = max(obs.faceCount, obs.subjects.count)
+        if prevFaceCount >= 0, faceCount != prevFaceCount {
+            let delta = faceCount - prevFaceCount
+            changes.append(delta > 0
                 ? "\(abs(delta)) person\(abs(delta) == 1 ? "" : "s") entered"
-                : "\(abs(delta)) person\(abs(delta) == 1 ? "" : "s") left"
+                : "\(abs(delta)) person\(abs(delta) == 1 ? "" : "s") left")
         }
 
-        let activity = obs.activityHints.first ?? ""
-        if !activity.isEmpty, activity != prevActivity, prevActivity != "" {
-            let act = "activity shifted to \(activity)"
-            changeDesc = changeDesc.map { "\($0); \(act)" } ?? act
+        // Body activity change (standing/seated/arms raised)
+        let activity = obs.bodyActivities.first ?? ""
+        if !activity.isEmpty, activity != prevBodyActivity, !prevBodyActivity.isEmpty {
+            changes.append("activity: \(activity)")
         }
 
+        // New hand gesture
+        let currentGestures = Set(obs.handGestures)
+        let newGestures = currentGestures.subtracting(prevHandGestures)
+        if !newGestures.isEmpty {
+            changes.append("gesture: \(newGestures.sorted().joined(separator: ", "))")
+        }
+
+        // New visible text
         let newOCR = Set(obs.visibleText).subtracting(prevOCRSnapshot)
         if !newOCR.isEmpty, !obs.visibleText.isEmpty {
-            let sample = newOCR.prefix(2).joined(separator: ", ")
-            let ocrChange = "text appeared: \"\(sample)\""
-            changeDesc = changeDesc.map { "\($0); \(ocrChange)" } ?? ocrChange
+            changes.append("text appeared: \"\(newOCR.prefix(2).joined(separator: ", "))\"")
         }
 
-        prevFaceCount   = obs.faceCount
-        if !activity.isEmpty { prevActivity = activity }
-        prevOCRSnapshot = Set(obs.visibleText.prefix(10))
+        // Update state
+        prevFaceCount    = faceCount
+        if !activity.isEmpty { prevBodyActivity = activity }
+        prevHandGestures = currentGestures
+        prevOCRSnapshot  = Set(obs.visibleText.prefix(10))
 
-        guard let change = changeDesc else { return }
+        guard !changes.isEmpty else { return }
 
         lastWriteTime = Date()
-        appendNarrativeBeat(change: change, obs: obs)
+        appendNarrativeBeat(change: changes.joined(separator: "; "), obs: obs)
     }
 
     // MARK: - Narrative append
@@ -191,22 +196,19 @@ final class JournalAnalyzer: ObservableObject {
         isWriting = true
         modelStatus = "Writing…"
 
-        // Last 4 sentences give the model enough thread to continue coherently.
-        let context = beats.suffix(4).map { $0.sentence }.joined(separator: " ")
-        let transcript = transcriber.map { t in
+        let context    = beats.suffix(4).map { $0.sentence }.joined(separator: " ")
+        let transcript = transcriber.flatMap { t -> String? in
             let words = t.transcript.split(separator: " ").suffix(40)
-            return words.isEmpty ? "" : "Recent speech: \"\(words.joined(separator: " "))\""
-        } ?? ""
+            return words.isEmpty ? nil : "Heard: \"\(words.joined(separator: " "))\""
+        }
 
-        let prompt = buildContinuationPrompt(
-            context: context, change: change, scene: obs.oneLiner, transcript: transcript
-        )
+        let prompt = buildPrompt(context: context, change: change,
+                                 scene: obs.oneLiner, transcript: transcript)
 
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             do {
-                let raw = try await self.runner.query(prompt, maxTokens: 60)
-                // Extract just the first sentence — model sometimes adds extras
+                let raw      = try await self.runner.query(prompt, maxTokens: 60)
                 let sentence = Self.firstSentence(raw)
                 await MainActor.run { [weak self] in
                     guard let self else { return }
@@ -222,32 +224,30 @@ final class JournalAnalyzer: ObservableObject {
                 await MainActor.run { [weak self] in
                     self?.isWriting   = false
                     self?.modelStatus = "Running"
-                    self?.logger.error("Narrative beat failed: \(error.localizedDescription)")
                 }
             }
         }
     }
 
-    private func buildContinuationPrompt(context: String, change: String,
-                                          scene: String, transcript: String) -> String {
-        var lines = [String]()
-        lines.append("A camera is observing a scene. Based only on what the camera can detect, describe what is happening.")
-        if !context.isEmpty {
-            lines.append("So far: \(context)")
-        }
-        lines.append("Detected in frame: \(scene)")
-        if !transcript.isEmpty { lines.append(transcript) }
+    private func buildPrompt(context: String, change: String,
+                             scene: String, transcript: String?) -> String {
+        var lines = ["A camera is observing a scene. Based only on what the camera can detect, describe what is happening."]
+        if !context.isEmpty  { lines.append("So far: \(context)") }
+        lines.append("Detected: \(scene)")
+        if let t = transcript { lines.append(t) }
         lines.append("New: \(change)")
         lines.append("")
-        lines.append("Write ONE present-tense sentence (max 20 words) describing only what is visible. No emotions, no guessing inner states, no drama.")
+        lines.append("Write ONE present-tense sentence (max 20 words) describing only what is visible. No emotions, no inner states.")
         return lines.joined(separator: "\n")
     }
 
     // MARK: - Vision pipeline
 
-    private static func runVisionSync(on image: CGImage) -> SceneObservation {
+    private static func runVisionSync(on image: CGImage,
+                                      subjects: [DetectedSubject]) -> SceneObservation {
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
 
+        // Scene classification
         var sceneLabels: [(String, Float)] = []
         let classifyReq = VNClassifyImageRequest()
         if (try? handler.perform([classifyReq])) != nil {
@@ -256,6 +256,7 @@ final class JournalAnalyzer: ObservableObject {
                 .map { ($0.identifier.replacingOccurrences(of: "_", with: " "), $0.confidence) }
         }
 
+        // OCR
         var visibleText: [String] = []
         let textReq = VNRecognizeTextRequest()
         textReq.recognitionLevel = .fast
@@ -266,42 +267,131 @@ final class JournalAnalyzer: ObservableObject {
                 .filter { $0.count > 2 }.prefix(6).map { $0 }
         }
 
+        // Face count (fallback when no tracker subjects)
         var faceCount = 0
-        let faceReq = VNDetectFaceRectanglesRequest()
-        if (try? handler.perform([faceReq])) != nil { faceCount = faceReq.results?.count ?? 0 }
+        if subjects.isEmpty {
+            let faceReq = VNDetectFaceRectanglesRequest()
+            if (try? handler.perform([faceReq])) != nil { faceCount = faceReq.results?.count ?? 0 }
+        }
 
-        var activityHints: [String] = []
+        // Body pose — richer activity hints
+        var bodyActivities: [String] = []
         let poseReq = VNDetectHumanBodyPoseRequest()
         if (try? handler.perform([poseReq])) != nil {
             for pose in (poseReq.results ?? []).prefix(3) {
-                if let h = bodyPoseHint(pose) { activityHints.append(h) }
+                if let hint = bodyActivityHint(pose) { bodyActivities.append(hint) }
             }
         }
 
-        return SceneObservation(timestamp: Date(), sceneLabels: sceneLabels,
-                                visibleText: visibleText, faceCount: faceCount,
-                                activityHints: activityHints)
+        // Hand gestures — NEW
+        var handGestures: [String] = []
+        let handReq = VNDetectHumanHandPoseRequest()
+        handReq.maximumHandCount = 2
+        if (try? handler.perform([handReq])) != nil {
+            for pose in (handReq.results ?? []).prefix(2) {
+                if let hint = handGestureHint(pose) { handGestures.append(hint) }
+            }
+        }
+
+        return SceneObservation(
+            timestamp: Date(),
+            sceneLabels: sceneLabels,
+            visibleText: visibleText,
+            subjects: subjects,
+            faceCount: faceCount,
+            bodyActivities: bodyActivities,
+            handGestures: handGestures
+        )
     }
 
-    private static func bodyPoseHint(_ pose: VNHumanBodyPoseObservation) -> String? {
-        guard let headY = try? pose.recognizedPoint(.nose).location.y,
-              let hipY  = try? pose.recognizedPoint(.rightHip).location.y else { return nil }
-        return headY > hipY + 0.2 ? "standing" : "seated"
+    /// Describes what a person's body is doing beyond just standing/seated.
+    private static func bodyActivityHint(_ pose: VNHumanBodyPoseObservation) -> String? {
+        var hints: [String] = []
+
+        // Standing vs seated
+        if let headY = try? pose.recognizedPoint(.nose).location.y,
+           let hipY  = try? pose.recognizedPoint(.rightHip).location.y {
+            hints.append(headY > hipY + 0.2 ? "standing" : "seated")
+        }
+
+        // Arms raised — wrist above shoulder
+        let leftArm  = armHint(pose, wrist: .leftWrist,  shoulder: .leftShoulder,  side: "left")
+        let rightArm = armHint(pose, wrist: .rightWrist, shoulder: .rightShoulder, side: "right")
+        if let l = leftArm  { hints.append(l) }
+        if let r = rightArm { hints.append(r) }
+
+        return hints.isEmpty ? nil : hints.joined(separator: ", ")
+    }
+
+    private static func armHint(
+        _ pose: VNHumanBodyPoseObservation,
+        wrist: VNHumanBodyPoseObservation.JointName,
+        shoulder: VNHumanBodyPoseObservation.JointName,
+        side: String
+    ) -> String? {
+        guard let wristPt    = try? pose.recognizedPoint(wrist),    wristPt.confidence > 0.5,
+              let shoulderPt = try? pose.recognizedPoint(shoulder), shoulderPt.confidence > 0.5
+        else { return nil }
+        // Vision y: 0 = bottom, 1 = top — so higher y = higher in image
+        if wristPt.location.y > shoulderPt.location.y + 0.08 {
+            return "\(side) arm raised"
+        }
+        // Arm extended horizontally
+        let dx = abs(wristPt.location.x - shoulderPt.location.x)
+        if dx > 0.15 {
+            return "\(side) arm extended"
+        }
+        return nil
+    }
+
+    /// Classifies hand pose into a descriptive gesture string.
+    private static func handGestureHint(_ pose: VNHumanHandPoseObservation) -> String? {
+        guard let points  = try? pose.recognizedPoints(.all),
+              let wrist   = points[.wrist], wrist.confidence > 0.5 else { return nil }
+
+        let tipJoints: [(VNHumanHandPoseObservation.JointName, String)] = [
+            (.thumbTip, "thumb"), (.indexTip, "index"), (.middleTip, "middle"),
+            (.ringTip, "ring"),   (.littleTip, "little")
+        ]
+
+        var extended: Set<String> = []
+        for (joint, name) in tipJoints {
+            guard let tip = points[joint], tip.confidence > 0.5 else { continue }
+            let dx = tip.location.x - wrist.location.x
+            let dy = tip.location.y - wrist.location.y
+            if sqrt(dx * dx + dy * dy) > 0.12 { extended.insert(name) }
+        }
+
+        switch extended.count {
+        case 4...:
+            // All fingers out — raised if wrist is in the upper half of frame
+            return wrist.location.y > 0.5 ? "raised open hand" : "open hand"
+        case 1 where extended.contains("index"):
+            return "pointing"
+        case 1 where extended.contains("thumb"):
+            // Thumb tip above wrist = thumbs up
+            if let thumbTip = points[.thumbTip],
+               thumbTip.confidence > 0.5,
+               thumbTip.location.y > wrist.location.y + 0.05 {
+                return "thumbs up"
+            }
+            return nil
+        case 0:
+            return "fist"
+        default:
+            return nil
+        }
     }
 
     // MARK: - Helpers
 
     private nonisolated static func firstSentence(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Stop at the first sentence-ending punctuation followed by whitespace or end
-        let pattern = "[.!?](?:\\s|$)"
-        if let range = trimmed.range(of: pattern, options: .regularExpression) {
+        if let range = trimmed.range(of: "[.!?](?:\\s|$)", options: .regularExpression) {
             return String(trimmed[trimmed.startIndex...range.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        // No punctuation found — return first 30 words as a fallback
-        let words = trimmed.split(separator: " ").prefix(30)
-        return words.joined(separator: " ")
+        return trimmed.split(separator: " ").prefix(30).joined(separator: " ")
     }
 
     // MARK: - On-disk journal
@@ -309,25 +399,16 @@ final class JournalAnalyzer: ObservableObject {
     private func writeSessionHeader() {
         guard let path = currentSessionPath else { return }
         let fmt = DateFormatter(); fmt.dateStyle = .full; fmt.timeStyle = .short
-        let header = """
-        # Journal — \(fmt.string(from: sessionStart))
-
-        > Model: \(runner.modelTag) · Apple Vision · continuous narrative
-
-        ---
-
-        """
+        let header = "# Journal — \(fmt.string(from: sessionStart))\n\n> Model: \(runner.modelTag) · Apple Vision · continuous narrative\n\n---\n\n"
         try? header.write(to: path, atomically: true, encoding: .utf8)
         updateIndex()
     }
 
     private func appendBeatToDisk(_ beat: NarrativeBeat) {
         guard let path = currentSessionPath else { return }
-        // Write just the sentence — the file reads like a flowing story
-        let text = beat.sentence + " "
         if let handle = try? FileHandle(forWritingTo: path) {
             handle.seekToEndOfFile()
-            handle.write(text.data(using: .utf8) ?? Data())
+            handle.write((beat.sentence + " ").data(using: .utf8) ?? Data())
             handle.closeFile()
         }
     }
