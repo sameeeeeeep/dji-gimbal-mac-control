@@ -81,8 +81,9 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var roomSweepState: RoomSweepState = .idle
     /// Persistent map of everyone detected during the initial sweep.
     @Published var subjectMap: [SubjectMapEntry] = []
-    /// Yaw angle the gimbal is currently sweeping toward — drives the splat-map cursor.
+    /// Current gimbal position during sweep — drives the splat-map cursor.
     @Published var sweepCurrentYaw: Double = 0
+    @Published var sweepCurrentPitch: Double = 0
 
     // MARK: - Panorama
     let panoramaBuilder = PanoramaBuilder()
@@ -90,47 +91,57 @@ final class CameraTracker: NSObject, ObservableObject {
     private var capturedScanFrames: [CapturedFrame] = []
     /// Last pixel buffer from the camera (written on camera queue, read on MainActor).
     nonisolated(unsafe) private var latestPixelBuffer: CVPixelBuffer? = nil
-    /// Shared CIContext for efficient frame-to-CGImage conversion.
-    nonisolated(unsafe) private let ciCtxCapture = CIContext(options: [.useSoftwareRenderer: false])
+    /// CIContext for MainActor-only frame captures (journal / captureCurrentFrame).
+    /// NOT shared with background tasks — CIContext is not concurrent-safe.
+    private let ciCtxMain = CIContext(options: [.useSoftwareRenderer: false])
+    /// Serial queue + dedicated CIContext for panorama background tasks.
+    private let panoramaQueue = DispatchQueue(label: "com.gimbal.panorama", qos: .utility)
+    nonisolated(unsafe) private let ciCtxPanorama = CIContext(options: [.useSoftwareRenderer: false])
 
     // MARK: - Point-and-go navigation
     /// True while a tap-to-navigate move is in progress.
     @Published var isNavigating: Bool = false
     private var navTarget: (yaw: Double, pitch: Double)? = nil
     private var navTimer: Timer? = nil
+    private var navStartTime: Date = .distantPast
     /// Degrees within target before we declare arrival.
     private let navArrivalDeg: Double = 8.0
+    /// Hard upper bound — prevents indefinite navigation when BLE position is stale.
+    private let navTimeoutSeconds: TimeInterval = 5.0
 
     private var sweepTimer: Timer?
     private var autoFollowAfterSweep: Bool = true
     private var sweepPhaseStart: Date = Date()
     private var sweepLastCollectTime: Date?
 
-    // MARK: Serpentine sweep config
+    // MARK: Column-first sweep config
 
-    /// 5-row spherical raster: top → bottom, alternating direction.
-    /// Covers ±28° pitch at 14° spacing for full room height (standing + seated).
-    private let sweepRows: [(pitch: Double, direction: Double)] = [
-        (pitch:  28, direction:  1),   // row 0 – high,       left → right
-        (pitch:  14, direction: -1),   // row 1 – upper-mid,  right → left
-        (pitch:   0, direction:  1),   // row 2 – eye,        left → right
-        (pitch: -14, direction: -1),   // row 3 – lower-mid,  right → left
-        (pitch: -28, direction:  1),   // row 4 – low,        left → right
-    ]
-    private var sweepCurrentRow: Int = 0
+    /// 7 columns, 45° apart — wide enough spacing to not get stuck navigating.
+    private let sweepColumnYaws: [Double] = [-135, -90, -45, 0, 45, 90, 135]
+    private let sweepPitchTop:    Double =  28    // top of scan range
+    private let sweepPitchBottom: Double = -28    // bottom of scan range
+    private var sweepCurrentCol:  Int    = 0
 
-    private enum SweepPhase { case sprintToEdge, tiltToRow, sweepRow, returning, done }
+    private enum SweepPhase { case sprintToStart, sweepColumn, stepToNextColumn, returning, done }
     private var sweepPhase: SweepPhase = .done
 
-    private let sweepSprintDuration: TimeInterval  = 1.8   // fast edge-sprint
-    private let sweepTiltDuration: TimeInterval    = 0.8   // pitch step between rows
-    private let sweepRowDuration: TimeInterval     = 16.0  // slow horizontal scan per row
-    private let sweepCollectInterval: TimeInterval = 0.35  // frame capture cadence
+    /// Wait after absolute-angle sprint to first column (transition time = 1.5 s + margin).
+    private let sweepSprintDuration:     TimeInterval = 2.5
+    /// Time to tilt through the full ±28° pitch range.
+    private let sweepColumnDuration:     TimeInterval = 5.5
+    /// Wait after absolute-angle step to next column (45° yaw = ~400 ms + margin).
+    private let sweepColumnStepDuration: TimeInterval = 1.2
+    private let sweepCollectInterval:    TimeInterval = 0.35  // frame capture cadence
 
-    /// Speed constants (speed-unit values sent to the gimbal).
-    private let sweepYawSlow:   Double = 180    // slow pan during scan
-    private let sweepYawFast:   Double = 900    // sprint to edge / return
-    private let sweepPitchFast: Double = 300    // tilt between rows
+    /// Speed constants used only for the slow column pitch sweep.
+    private let sweepYawFast:   Double = 900    // retained for legacy scan / voice search
+    private let sweepPitchFast: Double = 300    // retained for legacy scan
+    private let sweepPitchSlow: Double = 75     // slow tilt during column scan
+
+    /// Dead-reckoned position estimate — updated at each phase transition so panorama
+    /// frames have correct angular tags even when BLE position replies are stale.
+    private var deadReckonYaw:   Double = 0
+    private var deadReckonPitch: Double = 0
 
     /// Estimated camera horizontal FOV in degrees (used for world-position estimation).
     private let cameraFOVDeg: Double = 65
@@ -166,9 +177,10 @@ final class CameraTracker: NSObject, ObservableObject {
         }
     }
 
-    /// Sub-components for speaker detection and transcription.
-    let speakerManager = SpeakerFollowManager()
-    let transcriber = WhisperTranscriber()
+    /// Sub-components for speaker detection, transcription, and AI journaling.
+    let speakerManager    = SpeakerFollowManager()
+    let transcriber       = WhisperTranscriber()
+    let journalAnalyzer   = JournalAnalyzer()
 
     nonisolated(unsafe) private var bgSpeakerFollowEnabled: Bool = false
     /// Mirrors SpeakerFollowManager.isSpeechDetected for reading on the camera queue.
@@ -416,6 +428,7 @@ final class CameraTracker: NSObject, ObservableObject {
     func navigateTo(yaw: Double, pitch: Double) {
         stopNavigation()
         navTarget = (yaw: yaw, pitch: pitch)
+        navStartTime = Date()
         isNavigating = true
         navTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.navTick() }
@@ -425,6 +438,14 @@ final class CameraTracker: NSObject, ObservableObject {
     }
 
     private func navTick() {
+        // Hard timeout prevents infinite navigation when BLE position data is stale
+        if Date().timeIntervalSince(navStartTime) > navTimeoutSeconds {
+            onSpeedCommand?(0, 0)
+            stopNavigation()
+            logger.warning("NAV: timeout — stopping")
+            return
+        }
+
         guard let target = navTarget,
               let pos = getCurrentPosition?() else { return }
         onRequestPosition?()
@@ -469,21 +490,24 @@ final class CameraTracker: NSObject, ObservableObject {
         nextSpeakerNumber = 1
         voiceNoSpeakerFrames = 0
         autoFollowAfterSweep = autoFollow
-        sweepCurrentRow = 0
+        sweepCurrentCol = 0
 
         roomSweepState = .sweeping
-        sweepPhase = .sprintToEdge
+        sweepPhase = .sprintToStart
         sweepPhaseStart = Date()
         sweepLastCollectTime = nil
-        sweepCurrentYaw = 0
+        sweepCurrentYaw = sweepColumnYaws[0]
+        sweepCurrentPitch = sweepPitchTop
+        deadReckonYaw   = sweepColumnYaws[0]
+        deadReckonPitch = sweepPitchTop
 
-        // Phase 1: sprint hard-left to reach -160° (first row always sweeps right)
-        onSpeedCommand?(-sweepYawFast, 0)
+        // Absolute move to first column, top pitch — 1.5 s transition (time=150 → 1500 ms)
+        onAbsoluteMove?(sweepColumnYaws[0], sweepPitchTop, 150)
 
         sweepTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.sweepTick() }
         }
-        logger.info("SWEEP: serpentine started — \(self.sweepRows.count) rows, autoFollow=\(autoFollow)")
+        logger.info("SWEEP: column-first started — \(self.sweepColumnYaws.count) columns, autoFollow=\(autoFollow)")
     }
 
     private func sweepTick() {
@@ -495,20 +519,18 @@ final class CameraTracker: NSObject, ObservableObject {
 
         switch sweepPhase {
 
-        case .sprintToEdge:
-            // Reached left edge — tilt to the first row's pitch
+        case .sprintToStart:
+            // Reached top-left corner — begin first column scan
             if elapsed >= sweepSprintDuration {
-                beginTilt(at: now)
+                beginColumnSweep(at: now)
             }
 
-        case .tiltToRow:
-            if elapsed >= sweepTiltDuration {
-                beginRowSweep(at: now)
-            }
-
-        case .sweepRow:
+        case .sweepColumn:
             // Live cursor update
-            if let pos = getCurrentPosition?() { sweepCurrentYaw = pos.yaw }
+            if let pos = getCurrentPosition?() {
+                sweepCurrentYaw   = pos.yaw
+                sweepCurrentPitch = pos.pitch
+            }
 
             // Collect faces regularly
             if let last = sweepLastCollectTime,
@@ -517,28 +539,24 @@ final class CameraTracker: NSObject, ObservableObject {
                 sweepLastCollectTime = now
             }
 
-            if elapsed >= sweepRowDuration {
-                sweepCurrentRow += 1
-                if sweepCurrentRow < sweepRows.count {
-                    // Tilt to the next row (stop horizontal motion first)
-                    onSpeedCommand?(0, 0)
-                    beginTilt(at: now)
+            if elapsed >= sweepColumnDuration {
+                sweepCurrentCol += 1
+                onSpeedCommand?(0, 0)
+                if sweepCurrentCol < sweepColumnYaws.count {
+                    beginColumnStep(at: now)
                 } else {
                     beginReturn(at: now)
                 }
             }
 
-        case .returning:
-            // Poll position; stop once we're back near centre
-            if let pos = getCurrentPosition?() {
-                if abs(pos.yaw) < 12 && abs(pos.pitch) < 8 {
-                    onSpeedCommand?(0, 0)
-                    finishRoomSweep()
-                }
+        case .stepToNextColumn:
+            if elapsed >= sweepColumnStepDuration {
+                beginColumnSweep(at: now)
             }
-            // Safety timeout — stop after 3 s regardless
-            if elapsed >= 3.0 {
-                onSpeedCommand?(0, 0)
+
+        case .returning:
+            // Wait for the 2 s absolute-angle move to complete, then finish
+            if elapsed >= 2.5 {
                 finishRoomSweep()
             }
 
@@ -549,40 +567,66 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // MARK: Sweep phase helpers
 
-    private func beginTilt(at now: Date) {
-        sweepPhase = .tiltToRow
-        sweepPhaseStart = now
-        let targetPitch = sweepRows[sweepCurrentRow].pitch
-        // Determine previous pitch so we know which direction to tilt
-        let prevPitch: Double = sweepCurrentRow > 0 ? sweepRows[sweepCurrentRow - 1].pitch : 0
-        let pitchSpeed = targetPitch > prevPitch ? sweepPitchFast : -sweepPitchFast
-        onSpeedCommand?(0, pitchSpeed)
-        logger.info("SWEEP: tilting to row \(self.sweepCurrentRow) (pitch \(String(format: "%.0f", targetPitch))°)")
-    }
-
-    private func beginRowSweep(at now: Date) {
-        sweepPhase = .sweepRow
+    private func beginColumnSweep(at now: Date) {
+        sweepPhase = .sweepColumn
         sweepPhaseStart = now
         sweepLastCollectTime = now
-        let row = sweepRows[sweepCurrentRow]
-        onSpeedCommand?(row.direction * sweepYawSlow, 0)
-        logger.info("SWEEP: row \(self.sweepCurrentRow) — pitch \(String(format: "%.0f", row.pitch))°, dir \(row.direction > 0 ? "→" : "←")")
+        // Even columns scan top→bottom, odd columns scan bottom→top (less repositioning)
+        let pitchDir: Double = sweepCurrentCol % 2 == 0 ? -1 : 1
+        onSpeedCommand?(0, pitchDir * sweepPitchSlow)
+        let colYaw = sweepColumnYaws[min(sweepCurrentCol, sweepColumnYaws.count - 1)]
+        // Update dead-reckoned start: we've stepped to this column's yaw; pitch is at top or bottom
+        deadReckonYaw   = colYaw
+        deadReckonPitch = pitchDir > 0 ? sweepPitchBottom : sweepPitchTop   // we start at the far end
+        logger.info("SWEEP: column \(self.sweepCurrentCol) at yaw≈\(String(format: "%.0f", colYaw))°, dir \(pitchDir > 0 ? "↑" : "↓")")
+    }
+
+    private func beginColumnStep(at now: Date) {
+        sweepPhase = .stepToNextColumn
+        sweepPhaseStart = now
+        let nextYaw = sweepColumnYaws[min(sweepCurrentCol, sweepColumnYaws.count - 1)]
+        // Keep the same pitch we're at (the next column starts from this end).
+        // Even columns finish at bottom; odd finish at top — absolute move stays there.
+        let curPitch = sweepCurrentCol % 2 == 1 ? sweepPitchBottom : sweepPitchTop
+        // Absolute move: 45° yaw step, time=50 (500 ms)
+        onAbsoluteMove?(nextYaw, curPitch, 50)
+        logger.info("SWEEP: stepping to column \(self.sweepCurrentCol) yaw=\(String(format: "%.0f", nextYaw))°")
     }
 
     private func beginReturn(at now: Date) {
         sweepPhase = .returning
         sweepPhaseStart = now
-        let pos = getCurrentPosition?() ?? GimbalPosition()
-        // Sprint back toward yaw=0 and pitch=0 simultaneously
-        let yawSpeed   = pos.yaw   > 0 ? -sweepYawFast   :  sweepYawFast
-        let pitchSpeed = pos.pitch < 0 ?  sweepPitchFast : -sweepPitchFast
-        onSpeedCommand?(yawSpeed, pitchSpeed)
-        logger.info("SWEEP: returning to centre from yaw=\(String(format: "%.0f", pos.yaw))° pitch=\(String(format: "%.0f", pos.pitch))°")
+        // Absolute move to centre — 2 s transition (time=200)
+        onAbsoluteMove?(0, 0, 200)
+        logger.info("SWEEP: returning to centre")
     }
 
     /// Snapshot any subjects currently in frame: update the subject map + capture a frame for panorama.
     private func collectFacesForMap() {
-        guard let pos = getCurrentPosition?() else { return }
+        // Prefer BLE position; fall back to dead-reckoned estimate when BLE returns (0,0).
+        // During movement the gimbal often doesn't respond to position polls quickly enough,
+        // so dead-reckoning prevents all frames from landing at the canvas origin.
+        let blePos = getCurrentPosition?() ?? GimbalPosition()
+        let useBLE = abs(blePos.yaw) > 2.0 || abs(blePos.pitch) > 2.0
+
+        let estimatedPitch: Double
+        if sweepPhase == .sweepColumn {
+            let elapsed = Date().timeIntervalSince(sweepPhaseStart)
+            let frac    = min(elapsed / sweepColumnDuration, 1.0)
+            let pitchDir: Double = sweepCurrentCol % 2 == 0 ? -1 : 1
+            let startP = pitchDir > 0 ? sweepPitchBottom : sweepPitchTop
+            let endP   = pitchDir > 0 ? sweepPitchTop    : sweepPitchBottom
+            estimatedPitch = startP + (endP - startP) * frac
+        } else {
+            estimatedPitch = deadReckonPitch
+        }
+
+        let pos = useBLE ? blePos
+                         : GimbalPosition(yaw: deadReckonYaw, pitch: estimatedPitch, roll: 0)
+
+        if !useBLE {
+            logger.debug("SWEEP: BLE position stale — using dead-reckoned yaw=\(String(format:"%.0f",pos.yaw))° pitch=\(String(format:"%.0f",pos.pitch))°")
+        }
 
         // ── Face map ──────────────────────────────────────────────────────────
         for subject in allSubjects {
@@ -617,23 +661,30 @@ final class CameraTracker: NSObject, ObservableObject {
         captureFrameForPanorama(yaw: pos.yaw, pitch: pos.pitch)
     }
 
-    /// Convert the latest camera frame to a small CGImage and append it to the panorama buffer.
-    /// Runs on MainActor; conversion dispatched off-thread to avoid blocking.
+    /// Synchronously grabs the current camera frame as a CGImage for external analysis.
+    /// Runs on MainActor — uses the MainActor-only CIContext.
+    func captureCurrentFrame() -> CGImage? {
+        guard let pb = latestPixelBuffer else { return nil }
+        let ci    = CIImage(cvPixelBuffer: pb)
+        let scale = min(1.0, 512.0 / ci.extent.width)
+        let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return ciCtxMain.createCGImage(small, from: small.extent)
+    }
+
     private func captureFrameForPanorama(yaw: Double, pitch: Double) {
         guard let pb = latestPixelBuffer else { return }
 
-        // Hold onto local copies for the detached task (CVPixelBuffer is a CF object, safe to retain)
+        // Hold onto local copies; run on the serial panoramaQueue so the dedicated
+        // ciCtxPanorama is never used concurrently (CIContext is not concurrent-safe).
         let localBuffer  = pb
-        let localContext = ciCtxCapture
-
-        Task.detached(priority: .utility) { [weak self] in
+        let localContext = ciCtxPanorama
+        panoramaQueue.async { [weak self] in
             let ci    = CIImage(cvPixelBuffer: localBuffer)
-            // Downsample to ~480px wide — enough for panorama stitching, small enough to be fast
             let scale = min(1.0, 480.0 / ci.extent.width)
             let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             guard let cg = localContext.createCGImage(small, from: small.extent) else { return }
             let frame = CapturedFrame(image: cg, yaw: yaw, pitch: pitch)
-            await MainActor.run { [weak self] in
+            DispatchQueue.main.async { [weak self] in
                 self?.capturedScanFrames.append(frame)
             }
         }
@@ -643,20 +694,27 @@ final class CameraTracker: NSObject, ObservableObject {
         sweepPhase = .done
         cancelRoomSweep()
         roomSweepState = .ready
-        logger.info("SWEEP: complete — \(self.subjectMap.count) person(s) mapped, \(self.capturedScanFrames.count) frames captured")
 
-        // Build panorama from all captured frames
-        let frames = capturedScanFrames
-        if !frames.isEmpty {
-            panoramaBuilder.build(from: frames)
-        }
-
-        faceSlots = subjectMap.map { FaceSlot(center: .zero, confidence: 0, speakerNumber: $0.speakerNumber) }
-        guard autoFollowAfterSweep else { return }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            guard let self, self.isRunning, !self.isFollowing else { return }
-            self.startFollow()
+        // Wait for any in-flight panorama frame tasks to finish before building
+        panoramaQueue.async { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                logger.info("SWEEP: complete — \(self.subjectMap.count) person(s) mapped, \(self.capturedScanFrames.count) frames captured")
+                let frames = self.capturedScanFrames
+                if !frames.isEmpty {
+                    self.panoramaBuilder.build(from: frames)
+                } else {
+                    logger.error("SWEEP: no panorama frames — camera may not have been active or position data was unavailable")
+                }
+                let faceSlotsCopy = self.subjectMap.map { FaceSlot(center: .zero, confidence: 0, speakerNumber: $0.speakerNumber) }
+                self.faceSlots = faceSlotsCopy
+                guard self.autoFollowAfterSweep else { return }
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 800_000_000)
+                    guard let self, self.isRunning, !self.isFollowing else { return }
+                    self.startFollow()
+                }
+            }
         }
     }
 

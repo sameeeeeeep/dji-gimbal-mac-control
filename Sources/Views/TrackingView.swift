@@ -8,6 +8,7 @@ struct TrackingView: View {
     @ObservedObject var tracker: CameraTracker
 
     var body: some View {
+        ScrollView {
         VStack(spacing: 12) {
             HStack {
                 Text("Camera:")
@@ -192,10 +193,15 @@ struct TrackingView: View {
             // MARK: Speaker Follow
             SpeakerFollowSection(tracker: tracker)
 
-            Spacer()
+            Divider()
+
+            // MARK: AI Journal
+            JournalSection(tracker: tracker)
+
         }
         .padding()
         .frame(minWidth: 320)
+        } // ScrollView
         .onAppear {
             // Wire follow loop → gimbal speed (also set in GimbalService.init; kept for safety)
             tracker.onSpeedCommand = { [weak gimbal] yaw, pitch in
@@ -285,9 +291,10 @@ private struct RoomScanSection: View {
                     currentYaw: gimbal.state.currentPosition.yaw,
                     currentPitch: gimbal.state.currentPosition.pitch,
                     sweepState: tracker.roomSweepState,
-                    sweepCurrentYaw: tracker.sweepCurrentYaw
+                    sweepCurrentYaw: tracker.sweepCurrentYaw,
+                    sweepCurrentPitch: tracker.sweepCurrentPitch
                 )
-                Text("5-row serpentine scan in progress")
+                Text("Column scan in progress — top to bottom, stepping right")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
 
@@ -321,6 +328,7 @@ private struct RoomScanSection: View {
                         currentPitch: gimbal.state.currentPosition.pitch,
                         sweepState: tracker.roomSweepState,
                         sweepCurrentYaw: tracker.sweepCurrentYaw,
+                        sweepCurrentPitch: tracker.sweepCurrentPitch,
                         onTapSubject: { entry in
                             tracker.navigateTo(
                                 yaw:   entry.approximateYaw,
@@ -398,6 +406,7 @@ private struct SplatMapView: View {
     let currentPitch: Double
     let sweepState: RoomSweepState
     let sweepCurrentYaw: Double
+    var sweepCurrentPitch: Double = 0
     var onTapSubject: ((SubjectMapEntry) -> Void)? = nil
 
     private let yawMin: Double = -160
@@ -438,19 +447,27 @@ private struct SplatMapView: View {
                 }
                 .stroke(Color.white.opacity(0.15), lineWidth: 1)
 
-                // Sweep cursor
+                // Sweep cursor: vertical line for current column + horizontal scan line
                 if sweepState == .sweeping {
-                    let x = yawX(sweepCurrentYaw, w: w)
+                    let cx = yawX(sweepCurrentYaw, w: w)
+                    let sy = pitchY(sweepCurrentPitch, h: h)
+                    // Column marker (faint vertical)
+                    Rectangle()
+                        .fill(Color.cyan.opacity(0.15))
+                        .frame(width: 3, height: h)
+                        .position(x: cx, y: h / 2)
+                        .animation(.linear(duration: 0.3), value: sweepCurrentYaw)
+                    // Horizontal scan line moving through column
                     Rectangle()
                         .fill(
                             LinearGradient(
-                                colors: [.cyan.opacity(0), .cyan.opacity(0.7), .cyan.opacity(0)],
-                                startPoint: .top, endPoint: .bottom
+                                colors: [.cyan.opacity(0), .cyan.opacity(0.8), .cyan.opacity(0)],
+                                startPoint: .leading, endPoint: .trailing
                             )
                         )
-                        .frame(width: 3, height: h)
-                        .position(x: x, y: h / 2)
-                        .animation(.linear(duration: 0.3), value: sweepCurrentYaw)
+                        .frame(width: w, height: 2)
+                        .position(x: w / 2, y: sy)
+                        .animation(.linear(duration: 0.2), value: sweepCurrentPitch)
                 }
 
                 // Detected people
@@ -769,3 +786,151 @@ struct CameraPreviewView: NSViewRepresentable {
         previewLayer.session = tracker.captureSession
     }
 }
+
+// MARK: - AI Journal Section
+
+private struct JournalSection: View {
+    @ObservedObject var tracker: CameraTracker
+    @ObservedObject private var journal: JournalAnalyzer
+    @ObservedObject private var runner:  MLXRunner
+
+    init(tracker: CameraTracker) {
+        self.tracker = tracker
+        self.journal = tracker.journalAnalyzer
+        self.runner  = tracker.journalAnalyzer.runner
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+
+            // ── Header ───────────────────────────────────────────────────────
+            HStack {
+                Label("AI Journal", systemImage: "book.pages")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if journal.isAnalyzing {
+                    Button("Stop") { journal.stop() }
+                        .buttonStyle(.bordered).controlSize(.small).tint(.red)
+                } else {
+                    Button("Start") {
+                        journal.start(tracker: tracker, transcriber: tracker.transcriber)
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(!tracker.isRunning || !runner.isReady)
+                }
+            }
+
+            // ── MLX model status ─────────────────────────────────────────────
+            MLXStatusRow(runner: runner, journal: journal)
+
+            // ── Config (only when stopped) ───────────────────────────────────
+            if !journal.isAnalyzing, case .idle = runner.state {
+                HStack(spacing: 8) {
+                    Text("Model")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(width: 40, alignment: .leading)
+                    TextField("mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+                              text: $runner.modelTag)
+                        .font(.caption).textFieldStyle(.roundedBorder)
+                }
+                .padding(.vertical, 2)
+            }
+
+            // ── Live Vision strip ────────────────────────────────────────────
+            if journal.isAnalyzing, let obs = journal.latestObservation {
+                HStack(spacing: 4) {
+                    if journal.isWriting {
+                        ProgressView().scaleEffect(0.5)
+                    }
+                    Text(obs.oneLiner)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.purple.opacity(0.85))
+                        .lineLimit(1)
+                }
+                .padding(6)
+                .background(.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                .animation(.easeInOut(duration: 0.4), value: obs.timestamp)
+            }
+
+            // ── Running narrative ────────────────────────────────────────────
+            if !journal.narrative.isEmpty {
+                ScrollView {
+                    Text(journal.narrative)
+                        .font(.caption)
+                        .lineSpacing(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+                .frame(maxHeight: 160)
+                .background(.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.1)))
+                .animation(.easeIn(duration: 0.3), value: journal.beats.count)
+            } else if journal.isAnalyzing {
+                Text("Watching… first sentence appears on next scene change")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+// MARK: MLX status row
+
+private struct MLXStatusRow: View {
+    @ObservedObject var runner: MLXRunner
+    @ObservedObject var journal: JournalAnalyzer
+
+    var body: some View {
+        switch runner.state {
+        case .idle:
+            Button {
+                runner.start()
+            } label: {
+                Label("Load MLX Model", systemImage: "cpu")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+
+        case .loading(let name):
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.6)
+                Text("Loading \(name)…")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Text("first load ~30 s")
+                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+            }
+
+        case .ready:
+            HStack(spacing: 6) {
+                Circle().fill(Color.green).frame(width: 6, height: 6)
+                Text(journal.modelStatus).font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                if let path = journal.currentSessionPath {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([path])
+                    } label: { Image(systemName: "folder") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+            }
+
+        case .error(let msg):
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.orange).font(.caption2)
+                    Text(msg).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                }
+                if msg.contains("mlx_lm") {
+                    Text("Terminal: pip install mlx-lm")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Button("Retry") { runner.state = .idle; runner.start() }
+                    .font(.caption2).buttonStyle(.bordered).controlSize(.mini)
+            }
+        }
+    }
+}
+
