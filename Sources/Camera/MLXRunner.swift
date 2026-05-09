@@ -1,31 +1,35 @@
 import Foundation
+import AppKit
 import os
 
 // MARK: - Embedded Python inference server
 
 /// Written to ~/Library/Application Support/GimbalController/mlx_server.py on first start.
-/// Requires: pip install mlx-lm
+/// Requires: pip install mlx-vlm Pillow
 private let mlxServerScript = """
 #!/usr/bin/env python3
-# Gimbal MLX inference server — JSON-lines protocol on stdin/stdout
-# Requires: pip install mlx-lm
-import sys, json
+# Gimbal MLX VLM inference server — JSON-lines protocol on stdin/stdout
+# Requires: pip install mlx-vlm Pillow  (mlx_vlm >= 0.5)
+import sys, json, base64, tempfile, os
 
 def main():
-    model_tag = sys.argv[1] if len(sys.argv) > 1 else "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+    model_tag = sys.argv[1] if len(sys.argv) > 1 else "mlx-community/Qwen2-VL-2B-Instruct-4bit"
     print(json.dumps({"status": "loading", "model": model_tag}), flush=True)
 
     try:
-        from mlx_lm import load, generate
-    except ImportError:
+        from mlx_vlm import load, generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_config
+    except ImportError as e:
         print(json.dumps({
             "status": "error",
-            "message": "mlx_lm not installed — run: pip install mlx-lm"
+            "message": f"Missing dependency: {e} — run: pip install mlx-vlm Pillow"
         }), flush=True)
         sys.exit(1)
 
     try:
-        model, tokenizer = load(model_tag)
+        model, processor = load(model_tag)
+        config = load_config(model_tag)
         print(json.dumps({"status": "ready"}), flush=True)
     except Exception as e:
         print(json.dumps({"status": "error", "message": str(e)}), flush=True)
@@ -36,25 +40,55 @@ def main():
         if not line:
             continue
         req_id = ""
+        tmp_path = None
         try:
-            req    = json.loads(line)
-            req_id = req.get("id", "")
-            prompt = req.get("prompt", "")
-            max_tok = int(req.get("max_tokens", 300))
+            req     = json.loads(line)
+            req_id  = req.get("id", "")
+            prompt  = req.get("prompt", "Describe in one sentence what is happening.")
+            max_tok = int(req.get("max_tokens", 100))
+            img_b64 = req.get("image_b64")
 
+            # mlx_vlm 0.5 generate() expects file paths, not PIL objects
+            image_path = None
+            num_images = 0
+            if img_b64:
+                img_data = base64.b64decode(img_b64)
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                tmp.write(img_data)
+                tmp.close()
+                tmp_path = tmp.name
+                image_path = tmp_path
+                num_images = 1
+
+            # Use messages list — works for Qwen2.5-VL and other chat VLMs
             messages = [{"role": "user", "content": prompt}]
-            try:
-                text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+            formatted = apply_chat_template(
+                processor, config, messages, num_images=num_images
+            )
+            # apply_chat_template may return list or string depending on model
+            if not isinstance(formatted, str):
+                tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+                formatted = tok.apply_chat_template(
+                    formatted if isinstance(formatted, list) else messages,
+                    tokenize=False, add_generation_prompt=True
                 )
-            except Exception:
-                text = prompt
 
-            response = generate(model, tokenizer, prompt=text,
-                                max_tokens=max_tok, verbose=False)
+            result = generate(
+                model, processor,
+                prompt=formatted,
+                image=image_path,
+                max_tokens=max_tok,
+                verbose=False
+            )
+            # GenerationResult in mlx_vlm >= 0.5 has a .text attribute
+            response = result.text if hasattr(result, "text") else str(result)
             print(json.dumps({"id": req_id, "response": response}), flush=True)
         except Exception as e:
             print(json.dumps({"id": req_id, "error": str(e)}), flush=True)
+        finally:
+            if tmp_path:
+                try: os.unlink(tmp_path)
+                except Exception: pass
 
 if __name__ == "__main__":
     main()
@@ -80,16 +114,15 @@ enum MLXError: LocalizedError {
 
 // MARK: - MLXRunner
 
-/// Manages a long-lived Python mlx-lm subprocess.
+/// Manages a long-lived Python mlx-vlm subprocess (SmolVLM by default).
 ///
 /// Protocol (JSON lines on stdin/stdout):
-///   → {"id": "uuid", "prompt": "...", "max_tokens": 300}
+///   → {"id": "uuid", "prompt": "...", "max_tokens": 100, "image_b64": "<opt JPEG>"}
 ///   ← {"id": "uuid", "response": "..."}   OR  {"id": "uuid", "error": "..."}
 ///   ← {"status": "loading"|"ready"|"error", "model": "...", "message": "..."}
 ///
 /// The process is kept warm between calls so model weights stay in memory.
-/// On M1 Air 8 GB, Qwen2.5-1.5B-Instruct-4bit (~1.5 GB) loads in ~15 s and
-/// generates ~400 tokens in ~8 s — well within budget for event-driven queries.
+/// SmolVLM-4bit (~1.7 GB) loads in ~15 s on M1 Air and generates ~12 tokens/s.
 @MainActor
 final class MLXRunner: ObservableObject {
 
@@ -101,7 +134,7 @@ final class MLXRunner: ObservableObject {
     }
 
     @Published var state: State = .idle
-    @Published var modelTag = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+    @Published var modelTag = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 
     private var process:     Process?
     private var stdinHandle: FileHandle?
@@ -178,10 +211,9 @@ final class MLXRunner: ObservableObject {
 
     // MARK: - Query
 
-    /// Send a prompt to the running model and await the response.
+    /// Send a prompt (+ optional camera frame) to the VLM and await the response.
     /// Throws if the model is not ready or if inference fails.
-    /// `maxTokens` is capped at 600 to keep M1 Air cool.
-    func query(_ prompt: String, maxTokens: Int = 300) async throws -> String {
+    func query(_ prompt: String, image: CGImage? = nil, maxTokens: Int = 100) async throws -> String {
         guard case .ready = state else { throw MLXError.notReady }
         let id = UUID().uuidString
         return try await withCheckedThrowingContinuation { [weak self] cont in
@@ -190,8 +222,11 @@ final class MLXRunner: ObservableObject {
                 return
             }
             self.pending[id] = cont
-            let body: [String: Any] = ["id": id, "prompt": prompt,
-                                       "max_tokens": min(maxTokens, 600)]
+            var body: [String: Any] = ["id": id, "prompt": prompt,
+                                       "max_tokens": min(maxTokens, 200)]
+            if let cgImage = image, let b64 = Self.encodeJPEG(cgImage) {
+                body["image_b64"] = b64
+            }
             guard let data = try? JSONSerialization.data(withJSONObject: body) else {
                 self.pending.removeValue(forKey: id)
                 cont.resume(throwing: MLXError.processError("Serialization failed"))
@@ -199,6 +234,28 @@ final class MLXRunner: ObservableObject {
             }
             self.stdinHandle?.write(data + Data("\n".utf8))
         }
+    }
+
+    /// Encode a CGImage as a small JPEG for transport to the Python process.
+    /// Resizes to max 512px wide first — VLMs don't need full-res and it saves memory.
+    private static func encodeJPEG(_ image: CGImage) -> String? {
+        let maxW = 512
+        let scale = min(1.0, Double(maxW) / Double(image.width))
+        let w = max(1, Int(Double(image.width) * scale))
+        let h = max(1, Int(Double(image.height) * scale))
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ), let resized = { ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h)); return ctx.makeImage() }()
+        else { return nil }
+        let rep = NSBitmapImageRep(cgImage: resized)
+        guard let data = rep.representation(using: .jpeg,
+                                             properties: [.compressionFactor: 0.7]) else {
+            return nil
+        }
+        return data.base64EncodedString()
     }
 
     // MARK: - Stdout processing

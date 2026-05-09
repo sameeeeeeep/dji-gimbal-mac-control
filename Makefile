@@ -15,6 +15,7 @@ all:
 		--entitlements GimbalController.entitlements \
 		$(APP_BUNDLE)
 	mkdir -p ~/Applications
+	rm -rf ~/Applications/$(APP_NAME).app
 	cp -R $(APP_BUNDLE) ~/Applications/$(APP_NAME).app
 
 run: all

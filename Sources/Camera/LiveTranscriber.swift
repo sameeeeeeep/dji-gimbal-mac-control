@@ -21,6 +21,10 @@ final class LiveTranscriber: ObservableObject {
     /// The speaker label from the most recent transcription segment (e.g. "0", "1", "2").
     /// Nil when recognition hasn't identified a speaker yet.
     @Published var activeSpeakerLabel: String? = nil
+    /// Available microphone inputs, including Continuity Camera (iPhone) mics.
+    @Published var availableMicrophones: [AVCaptureDevice] = []
+    /// Currently selected microphone (nil = system default).
+    @Published var selectedMicrophone: AVCaptureDevice? = nil
 
     // MARK: - Background-thread readable
 
@@ -76,6 +80,15 @@ final class LiveTranscriber: ObservableObject {
         bgCurrentSpeakerLabel = nil
         onSpeakerLabelChanged?(nil)
         tearDown()
+    }
+
+    func refreshMicrophones() {
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInMicrophone, .external, .continuityCamera],
+            mediaType: .audio,
+            position: .unspecified
+        )
+        availableMicrophones = session.devices
     }
 
     // MARK: - Rolling recognition window
