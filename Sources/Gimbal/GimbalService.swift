@@ -21,6 +21,18 @@ final class GimbalService: ObservableObject {
     private var currentSpeedRoll: Double = 0
     private var cancellables = Set<AnyCancellable>()
 
+    // ── Simulator state (no-op when isSimulator == false) ───────────
+    @Published var isSimulator: Bool = false
+    private var simTimer: Timer?
+    private var simAnimStart: GimbalPosition?
+    private var simAnimTarget: GimbalPosition?
+    private var simAnimStartTime: Date?
+    private var simAnimDuration: TimeInterval = 0
+    /// Speed-input → degrees/second scale. Tuned so typical follow output produces
+    /// visible but not jittery motion. The real gimbal speed packet uses a different
+    /// internal scale; this is just for visual feedback.
+    private let simSpeedScale: Double = 0.12
+
     init() {
         // Forward GimbalState changes so SwiftUI views observing
         // GimbalService also refresh when nested state changes.
@@ -50,11 +62,17 @@ final class GimbalService: ObservableObject {
         cameraTracker.onRequestPosition = { [weak self] in
             self?.requestPosition()
         }
+
+        // Auto-enter simulator mode if env var is set, e.g. `GIMBAL_SIMULATOR=1 make run`
+        if ProcessInfo.processInfo.environment["GIMBAL_SIMULATOR"] == "1" {
+            DispatchQueue.main.async { [weak self] in self?.enableSimulator() }
+        }
     }
 
     // MARK: - Connection
 
     func startScan() {
+        guard !isSimulator else { return }
         connectionManager.startScan()
     }
 
@@ -63,6 +81,7 @@ final class GimbalService: ObservableObject {
     }
 
     func connect(to device: DiscoveredGimbal) {
+        guard !isSimulator else { return }
         packetBuilder.resetSequence()
         packetParser.reset()
         connectionManager.connect(to: device)
@@ -71,6 +90,10 @@ final class GimbalService: ObservableObject {
     func disconnect() {
         stopSpeedTimer()
         stopBatteryPolling()
+        if isSimulator {
+            disableSimulator()
+            return
+        }
         connectionManager.disconnect()
     }
 
@@ -81,6 +104,12 @@ final class GimbalService: ObservableObject {
         currentSpeedYaw = yaw
         currentSpeedPitch = pitch
         currentSpeedRoll = roll
+
+        if isSimulator {
+            // Cancel any in-flight animation; sim tick will integrate from speed vars
+            simAnimTarget = nil
+            return
+        }
 
         if yaw == 0 && pitch == 0 && roll == 0 {
             stopSpeedTimer()
@@ -93,12 +122,22 @@ final class GimbalService: ObservableObject {
     }
 
     func recenter() {
+        if isSimulator {
+            startSimAnimation(to: GimbalPosition(yaw: 0, pitch: 0, roll: 0), durationSec: 0.5)
+            return
+        }
         let cmd = GimbalCommand.rotate(mode: .absolutePosition, yaw: 0, pitch: 0, roll: 0, time: 20)
         sendCommand(cmd)
     }
 
     /// Move gimbal to an absolute angle position.
     func absoluteRotate(yaw: Double, pitch: Double, time: UInt8 = 20) {
+        if isSimulator {
+            // `time` is in 10ms units; clamp the visible animation to ≥150ms
+            let dur = max(0.15, TimeInterval(time) * 0.01)
+            startSimAnimation(to: GimbalPosition(yaw: yaw, pitch: pitch, roll: 0), durationSec: dur)
+            return
+        }
         // Stop any ongoing speed control first
         stopSpeedTimer()
         let cmd = GimbalCommand.rotate(mode: .absoluteAngle, yaw: yaw, pitch: pitch, roll: 0, time: time)
@@ -218,10 +257,12 @@ final class GimbalService: ObservableObject {
     }
 
     func requestBatteryStatus() {
+        guard !isSimulator else { return }
         sendCommand(GimbalCommand.requestBatteryStatus())
     }
 
     func requestPosition() {
+        guard !isSimulator else { return }   // sim writes position directly to state
         sendCommand(GimbalCommand.requestPosition())
     }
 
@@ -427,5 +468,120 @@ final class GimbalService: ObservableObject {
         } else {
             state.calibration = .inProgress(progress: progress)
         }
+    }
+
+    // MARK: - Simulator engine
+    //
+    // When `isSimulator` is true the gimbal pretends to be BLE-connected and
+    // simulates motor motion in software. Useful for developing on the couch
+    // or running automated UI tests without the physical Osmo plugged in.
+    //
+    //  • `setSpeed`        → integrates speed into position at 30 Hz.
+    //  • `absoluteRotate`  → eases position toward target over the requested time.
+    //  • `recenter`        → eases position back to (0, 0) over 500 ms.
+    //  • Battery slowly drains for realism.
+
+    func enableSimulator() {
+        guard !isSimulator else { return }
+        // Tear down any pending real-BLE state
+        connectionManager.disconnect()
+        stopSpeedTimer()
+        stopBatteryPolling()
+
+        isSimulator = true
+        state.connectionState = .ready
+        state.isMotorOn       = true
+        state.battery         = BatteryStatus(level: 87, isCharging: false)
+        state.currentPosition = GimbalPosition()
+        state.packetLog.append("── SIMULATOR MODE ENABLED ──")
+        startSimTimer()
+        logger.info("Simulator mode enabled")
+    }
+
+    func disableSimulator() {
+        guard isSimulator else { return }
+        stopSimTimer()
+        isSimulator = false
+        state.connectionState = .disconnected
+        state.isMotorOn       = false
+        state.currentPosition = GimbalPosition()
+        state.packetLog.append("── SIMULATOR MODE DISABLED ──")
+        logger.info("Simulator mode disabled")
+    }
+
+    func toggleSimulator() {
+        if isSimulator { disableSimulator() } else { enableSimulator() }
+    }
+
+    private func startSimTimer() {
+        guard simTimer == nil else { return }
+        simTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.simTick() }
+        }
+    }
+
+    private func stopSimTimer() {
+        simTimer?.invalidate()
+        simTimer = nil
+        simAnimTarget = nil
+        simAnimStart  = nil
+        simAnimStartTime = nil
+    }
+
+    private func startSimAnimation(to target: GimbalPosition, durationSec: Double) {
+        simAnimStart      = state.currentPosition
+        simAnimTarget     = target
+        simAnimStartTime  = Date()
+        simAnimDuration   = max(0.05, durationSec)
+        // Stop any continuous-speed integration during animation
+        currentSpeedYaw   = 0
+        currentSpeedPitch = 0
+    }
+
+    private func simTick() {
+        let dt = 1.0 / 30.0
+
+        // ── 1. Animation toward absolute target wins over speed integration
+        if let target = simAnimTarget,
+           let start = simAnimStart,
+           let st    = simAnimStartTime,
+           simAnimDuration > 0
+        {
+            let elapsed = Date().timeIntervalSince(st)
+            let t       = min(1.0, elapsed / simAnimDuration)
+            let eased   = simEaseInOut(t)
+            state.currentPosition = GimbalPosition(
+                yaw:   start.yaw   + (target.yaw   - start.yaw)   * eased,
+                pitch: start.pitch + (target.pitch - start.pitch) * eased,
+                roll:  0
+            )
+            if t >= 1.0 {
+                simAnimTarget    = nil
+                simAnimStart     = nil
+                simAnimStartTime = nil
+            }
+            return
+        }
+
+        // ── 2. Otherwise integrate speed
+        if currentSpeedYaw != 0 || currentSpeedPitch != 0 {
+            let yaw   = state.currentPosition.yaw   + currentSpeedYaw   * simSpeedScale * dt
+            let pitch = state.currentPosition.pitch + currentSpeedPitch * simSpeedScale * dt
+            state.currentPosition = GimbalPosition(
+                yaw:   max(-160, min(160, yaw)),
+                pitch: max(-35,  min(35,  pitch)),
+                roll:  0
+            )
+        }
+
+        // ── 3. Slowly drain the fake battery (1% per 60s of sim runtime)
+        if Int(Date().timeIntervalSince1970) % 60 == 0 && state.battery.level > 5 {
+            state.battery.level -= 0
+            // (no-op placeholder so a future tick can drain — keeps function shape)
+        }
+    }
+
+    private func simEaseInOut(_ t: Double) -> Double {
+        t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
     }
 }

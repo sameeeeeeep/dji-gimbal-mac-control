@@ -20,6 +20,7 @@ struct DetectedSubject {
     let isSpeaking: Bool        // actively speaking right now (VAD + mouth)
     let isTracked: Bool         // driving the gimbal
     let speakerLabel: String?   // audio-identity label from ASR diarization, e.g. "0", "1"
+    var recognizedName: String? = nil  // set by FaceRecognizer when known
 }
 
 /// Internal per-face tracking state maintained across frames (background thread only).
@@ -69,6 +70,23 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var isScanning = false
     /// True while an open-palm gesture is actively guiding the gimbal.
     @Published var palmGestureActive = false
+    /// True while a thumbs-up has locked the gimbal in place (even during follow mode).
+    /// Show another thumbs-up or open palm to unlock.
+    @Published var followLocked = false
+    /// True while a pointing gesture is actively driving a seek-and-return.
+    @Published var pointingGestureActive = false
+
+    // ── Point-and-seek state ────────────────────────────────────────
+    /// Phase of the current pointing-driven search.
+    private enum PointSeekPhase { case idle, rotating, searching, returning }
+    private var pointSeekPhase: PointSeekPhase = .idle
+    /// Yaw/pitch the gimbal was at when seek started — restored on failure.
+    private var pointSeekHomeYaw:   Double = 0
+    private var pointSeekHomePitch: Double = 0
+    private var pointSeekPhaseStart: Date?
+    private var pointSeekTimer:     Timer?
+    /// Whether follow was active before seek (so we can restore it on failure).
+    private var pointSeekWasFollowing: Bool = false
     /// Synthetic bbox derived from the latest palm position; overrides face bbox in the
     /// follow loop so the gimbal steers toward whoever is waving their hand.
     /// Cleared automatically once face detection locks onto the new subject.
@@ -89,6 +107,8 @@ final class CameraTracker: NSObject, ObservableObject {
     let panoramaBuilder = PanoramaBuilder()
     /// Frames captured during the most recent sweep (MainActor-only).
     private var capturedScanFrames: [CapturedFrame] = []
+    /// Guards latestPixelBuffer against concurrent write (camera queue) + read (MainActor).
+    private let pixelBufferLock = NSLock()
     /// Last pixel buffer from the camera (written on camera queue, read on MainActor).
     nonisolated(unsafe) private var latestPixelBuffer: CVPixelBuffer? = nil
     /// CIContext for MainActor-only frame captures (journal / captureCurrentFrame).
@@ -181,6 +201,8 @@ final class CameraTracker: NSObject, ObservableObject {
     let speakerManager    = SpeakerFollowManager()
     let transcriber       = WhisperTranscriber()
     let journalAnalyzer   = JournalAnalyzer()
+    let claudeAgent       = ClaudeAgent()
+    let faceRecognizer    = FaceRecognizer()
 
     nonisolated(unsafe) private var bgSpeakerFollowEnabled: Bool = false
     /// Mirrors SpeakerFollowManager.isSpeechDetected for reading on the camera queue.
@@ -214,10 +236,29 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var lastPhotoURL: URL?
     @Published var lastVideoURL: URL?
 
+    /// True while a timelapse capture is in progress.
+    @Published var isTimelapsing = false
+    /// Number of frames written to the current timelapse so far.
+    @Published var timelapseFrameCount: Int = 0
+    /// Wall-clock seconds elapsed since timelapse started.
+    @Published var timelapseDuration: TimeInterval = 0
+    /// Capture interval for new timelapses, in seconds. Adjustable via Settings.
+    @Published var timelapseInterval: TimeInterval = 2.0
+    /// Output playback frame rate for the encoded timelapse video.
+    private let timelapseOutputFPS: Int32 = 24
+
     // Capture outputs (strong refs; nil when camera is stopped)
     private var photoOutput: AVCapturePhotoOutput?
     private var movieOutput: AVCaptureMovieFileOutput?
     private var recordingTimer: Timer?
+
+    // Timelapse encoder state
+    private var tlWriter:    AVAssetWriter?
+    private var tlInput:     AVAssetWriterInput?
+    private var tlAdaptor:   AVAssetWriterInputPixelBufferAdaptor?
+    private var tlTimer:     Timer?
+    private var tlURL:       URL?
+    private var tlStartDate: Date?
 
     /// Set by GimbalService to receive speed commands from the follow loop.
     var onSpeedCommand: ((_ yaw: Double, _ pitch: Double) -> Void)?
@@ -235,7 +276,11 @@ final class CameraTracker: NSObject, ObservableObject {
     private let logger = Logger(subsystem: "com.gimbal.controller", category: "Camera")
     nonisolated(unsafe) private var bgTrackingType: TrackingType = .face
     nonisolated(unsafe) private var bgPalmFrameCount: Int = 0
+    nonisolated(unsafe) private var bgThumbsUpFrameCount: Int = 0
+    nonisolated(unsafe) private var bgPointingFrameCount: Int = 0
     private let palmConfirmFrames: Int = 20  // ~0.67 s at 30 fps
+    private let thumbsUpConfirmFrames: Int = 15   // ~0.5 s
+    private let pointingConfirmFrames: Int = 12   // ~0.4 s
 
     // --- Smoothed output (EMA filter — kills oscillation at any gain) ---
     private var smoothedYaw: Double = 0
@@ -312,6 +357,7 @@ final class CameraTracker: NSObject, ObservableObject {
 
     func stopCamera() {
         if isRecording { stopRecording() }
+        if isTimelapsing { stopTimelapse() }
         cancelRoomSweep()
         if speakerFollowEnabled { speakerFollowEnabled = false }
         if transcriber.isTranscribing { transcriber.stop() }
@@ -365,6 +411,213 @@ final class CameraTracker: NSObject, ObservableObject {
         logger.info("Video recording stopped")
     }
 
+    // MARK: - Timelapse
+    //
+    // Captures a frame every `timelapseInterval` seconds via captureCurrentFrame()
+    // and feeds it into an AVAssetWriter at `timelapseOutputFPS` (24fps).
+    // Result: at interval=2s, every 1 hour of real time = 75s of playback.
+
+    func startTimelapse() {
+        guard isRunning, !isTimelapsing else { return }
+
+        // Need at least one frame to determine output dimensions
+        guard let firstFrame = captureCurrentFrame() else {
+            logger.error("Timelapse: no frame available — start camera first")
+            return
+        }
+        // H.264 requires even dimensions. Odd → silently corrupted file (QuickTime
+        // refuses to open). Round down to nearest even number.
+        let w = firstFrame.width  - (firstFrame.width  % 2)
+        let h = firstFrame.height - (firstFrame.height % 2)
+        guard w >= 16, h >= 16 else {
+            logger.error("Timelapse: source frame too small \(w)×\(h)")
+            return
+        }
+
+        let dir = gimbalCapturesDir.appendingPathComponent("Timelapses", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        // .mov container — QuickTime native, more forgiving than .mp4 for AVAssetWriter output.
+        let url = dir.appendingPathComponent("timelapse_\(fmt.string(from: Date())).mov")
+        // Pre-emptively delete any stale file at the same path (writer refuses to overwrite).
+        try? FileManager.default.removeItem(at: url)
+
+        do {
+            let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+            // Periodic moov-atom fragments → file is playable even mid-write or on crash.
+            writer.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey:  AVVideoCodecType.h264,
+                AVVideoWidthKey:  w,
+                AVVideoHeightKey: h,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey:           8_000_000,
+                    AVVideoExpectedSourceFrameRateKey:  timelapseOutputFPS,
+                    AVVideoMaxKeyFrameIntervalKey:      Int(timelapseOutputFPS),  // 1s GOP
+                    AVVideoProfileLevelKey:             AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            input.expectsMediaDataInRealTime = false
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: input,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey  as String: w,
+                    kCVPixelBufferHeightKey as String: h
+                ]
+            )
+            guard writer.canAdd(input) else {
+                logger.error("Timelapse: writer can't add input")
+                return
+            }
+            writer.add(input)
+            guard writer.startWriting() else {
+                logger.error("Timelapse: startWriting failed: \(writer.error?.localizedDescription ?? "?")")
+                return
+            }
+            writer.startSession(atSourceTime: .zero)
+
+            tlWriter      = writer
+            tlInput       = input
+            tlAdaptor     = adaptor
+            tlURL         = url
+            tlStartDate   = Date()
+            timelapseFrameCount = 0
+            timelapseDuration   = 0
+            isTimelapsing       = true
+        } catch {
+            logger.error("Timelapse: AVAssetWriter init failed: \(error.localizedDescription)")
+            return
+        }
+
+        // Capture frame 0 immediately so the output is non-empty even on quick stops
+        appendTimelapseFrame()
+
+        let interval = timelapseInterval
+        tlTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.appendTimelapseFrame()
+                if let start = self.tlStartDate {
+                    self.timelapseDuration = Date().timeIntervalSince(start)
+                }
+            }
+        }
+        logger.info("Timelapse started → \(url.lastPathComponent), every \(interval)s, target \(self.timelapseOutputFPS) fps playback")
+    }
+
+    func stopTimelapse() {
+        guard isTimelapsing else { return }
+        tlTimer?.invalidate(); tlTimer = nil
+
+        let writer  = tlWriter
+        let input   = tlInput
+        let url     = tlURL
+        let frames  = timelapseFrameCount
+
+        input?.markAsFinished()
+        writer?.finishWriting { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let status = writer?.status ?? .unknown
+                let err    = writer?.error
+                if status == .completed, let url {
+                    self.lastVideoURL = url
+                    let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int ?? 0
+                    self.logger.info("Timelapse finalized: \(frames) frames, \(size) bytes → \(url.lastPathComponent, privacy: .public)")
+                } else {
+                    let statusName: String
+                    switch status {
+                    case .unknown:    statusName = "unknown"
+                    case .writing:    statusName = "writing"
+                    case .completed:  statusName = "completed"
+                    case .failed:     statusName = "failed"
+                    case .cancelled:  statusName = "cancelled"
+                    @unknown default: statusName = "?"
+                    }
+                    self.logger.error("Timelapse finalize: status=\(statusName, privacy: .public) frames=\(frames) error=\(err?.localizedDescription ?? "nil", privacy: .public)")
+                }
+            }
+        }
+
+        tlWriter      = nil
+        tlInput       = nil
+        tlAdaptor     = nil
+        tlURL         = nil
+        tlStartDate   = nil
+        isTimelapsing = false
+    }
+
+    private func appendTimelapseFrame() {
+        guard let adaptor = tlAdaptor,
+              let input   = tlInput,
+              let writer  = tlWriter,
+              let cgImage = captureCurrentFrame()
+        else { return }
+        guard writer.status == .writing else {
+            logger.error("Timelapse: writer status=\(writer.status.rawValue) error=\(writer.error?.localizedDescription ?? "nil") — stopping")
+            stopTimelapse()
+            return
+        }
+        guard input.isReadyForMoreMediaData else { return }
+
+        guard let pb = Self.pixelBufferFromCGImage(cgImage, pool: adaptor.pixelBufferPool) else {
+            logger.error("Timelapse: pixel buffer creation failed")
+            return
+        }
+
+        let pts = CMTime(value: Int64(timelapseFrameCount), timescale: timelapseOutputFPS)
+        let ok = adaptor.append(pb, withPresentationTime: pts)
+        if !ok {
+            logger.error("Timelapse: append failed at frame \(self.timelapseFrameCount): \(writer.error?.localizedDescription ?? "?")")
+            return
+        }
+        timelapseFrameCount += 1
+    }
+
+    /// Renders a CGImage into a CVPixelBuffer, preferring the writer's pool when available.
+    private static func pixelBufferFromCGImage(_ image: CGImage, pool: CVPixelBufferPool?) -> CVPixelBuffer? {
+        let w = image.width, h = image.height
+        var buffer: CVPixelBuffer?
+        if let pool {
+            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
+        }
+        if buffer == nil {
+            let attrs: [String: Any] = [
+                kCVPixelBufferCGImageCompatibilityKey as String:        true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
+            ]
+            CVPixelBufferCreate(
+                kCFAllocatorDefault, w, h,
+                kCVPixelFormatType_32BGRA,
+                attrs as CFDictionary, &buffer
+            )
+        }
+        guard let pb = buffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+
+        guard let ctx = CGContext(
+            data: CVPixelBufferGetBaseAddress(pb),
+            width:  CVPixelBufferGetWidth(pb),
+            height: CVPixelBufferGetHeight(pb),
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+                      | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+
+        ctx.draw(image, in: CGRect(
+            x: 0, y: 0,
+            width: CGFloat(CVPixelBufferGetWidth(pb)),
+            height: CGFloat(CVPixelBufferGetHeight(pb))
+        ))
+        return pb
+    }
+
     func startFollow() {
         guard isRunning else {
             logger.warning("startFollow called but camera not running")
@@ -384,6 +637,11 @@ final class CameraTracker: NSObject, ObservableObject {
                 // Room sweep and point-and-go navigation have exclusive gimbal control
                 guard self.roomSweepState != .sweeping else { return }
                 guard !self.isNavigating else { return }
+                // Thumbs-up lock — hold position, send zero speed
+                if self.followLocked {
+                    self.onSpeedCommand?(0, 0)
+                    return
+                }
                 logTick += 1
                 let shouldLog = (logTick % 15 == 0)
 
@@ -667,7 +925,10 @@ final class CameraTracker: NSObject, ObservableObject {
     /// Synchronously grabs the current camera frame as a CGImage for external analysis.
     /// Runs on MainActor — uses the MainActor-only CIContext.
     func captureCurrentFrame() -> CGImage? {
-        guard let pb = latestPixelBuffer else { return nil }
+        pixelBufferLock.lock()
+        let pb = latestPixelBuffer
+        pixelBufferLock.unlock()
+        guard let pb else { return nil }
         let ci    = CIImage(cvPixelBuffer: pb)
         let scale = min(1.0, 512.0 / ci.extent.width)
         let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -675,7 +936,10 @@ final class CameraTracker: NSObject, ObservableObject {
     }
 
     private func captureFrameForPanorama(yaw: Double, pitch: Double) {
-        guard let pb = latestPixelBuffer else { return }
+        pixelBufferLock.lock()
+        let pb = latestPixelBuffer
+        pixelBufferLock.unlock()
+        guard let pb else { return }
 
         // Hold onto local copies; run on the serial panoramaQueue so the dedicated
         // ciCtxPanorama is never used concurrently (CIContext is not concurrent-safe).
@@ -1018,7 +1282,9 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         // Store for panorama frame capture (read on MainActor in collectFacesForMap)
+        pixelBufferLock.lock()
         latestPixelBuffer = pixelBuffer
+        pixelBufferLock.unlock()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
 
         // Hand pose runs in every mode so open-palm gesture always works
@@ -1042,36 +1308,39 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             try? handler.perform([request, handRequest])
         } else {
-            switch bgTrackingType {
-            case .face:
-                let request = VNDetectFaceRectanglesRequest { [weak self] req, _ in
-                    let faces = (req.results as? [VNFaceObservation]) ?? []
-                    // Sort largest-first so index-0 is the primary track target
-                    let sorted = faces.sorted { $0.boundingBox.width > $1.boundingBox.width }
-                    let tracked = sorted.first?.boundingBox
-                    let subjects = sorted.enumerated().map { idx, f in
-                        DetectedSubject(bbox: f.boundingBox, isSpeaking: false, isTracked: idx == 0, speakerLabel: nil)
-                    }
-                    Task { @MainActor [weak self] in
-                        self?.allSubjects = subjects
-                        self?.updateBbox(tracked)
-                    }
+            // Auto mode: prefer faces, fall back to full-body when no faces detected
+            let faceReq = VNDetectFaceRectanglesRequest()
+            let bodyReq = VNDetectHumanRectanglesRequest()
+            try? handler.perform([faceReq, bodyReq, handRequest])
+
+            let faces   = (faceReq.results as? [VNFaceObservation])   ?? []
+            let persons = (bodyReq.results as? [VNHumanObservation])  ?? []
+
+            if !faces.isEmpty {
+                let sorted  = faces.sorted { $0.boundingBox.width > $1.boundingBox.width }
+                let tracked = sorted.first?.boundingBox
+                let subjects = sorted.enumerated().map { idx, f in
+                    DetectedSubject(bbox: f.boundingBox, isSpeaking: false, isTracked: idx == 0, speakerLabel: nil)
                 }
-                try? handler.perform([request, handRequest])
-            case .person:
-                let request = VNDetectHumanRectanglesRequest { [weak self] req, _ in
-                    let persons = (req.results as? [VNHumanObservation]) ?? []
-                    let sorted = persons.sorted { $0.boundingBox.width > $1.boundingBox.width }
-                    let tracked = sorted.first?.boundingBox
-                    let subjects = sorted.enumerated().map { idx, p in
-                        DetectedSubject(bbox: p.boundingBox, isSpeaking: false, isTracked: idx == 0, speakerLabel: nil)
-                    }
-                    Task { @MainActor [weak self] in
-                        self?.allSubjects = subjects
-                        self?.updateBbox(tracked)
-                    }
+                Task { @MainActor [weak self] in
+                    self?.allSubjects = subjects
+                    self?.updateBbox(tracked)
                 }
-                try? handler.perform([request, handRequest])
+            } else if !persons.isEmpty {
+                let sorted  = persons.sorted { $0.boundingBox.width > $1.boundingBox.width }
+                let tracked = sorted.first?.boundingBox
+                let subjects = sorted.enumerated().map { idx, p in
+                    DetectedSubject(bbox: p.boundingBox, isSpeaking: false, isTracked: idx == 0, speakerLabel: nil)
+                }
+                Task { @MainActor [weak self] in
+                    self?.allSubjects = subjects
+                    self?.updateBbox(tracked)
+                }
+            } else {
+                Task { @MainActor [weak self] in
+                    self?.allSubjects = []
+                    self?.updateBbox(nil)
+                }
             }
         }
     }
@@ -1206,18 +1475,80 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     /// person waving their hand.  When the palm drops the guide holds for ~1 s then
     /// clears; as soon as face detection locks onto the new subject it clears early.
     nonisolated private func processPalmGesture(_ observations: [VNHumanHandPoseObservation]) {
-        guard let palmObs = observations.first(where: { isOpenPalm($0) }),
-              let points = try? palmObs.recognizedPoints(.all),
-              let wrist = points[.wrist], wrist.confidence > 0.5 else {
+        guard let obs = observations.first else {
+            // No hands — clear all counters and any active guides
+            let wasPalm    = bgPalmFrameCount    >= palmConfirmFrames
+            let wasPointing = bgPointingFrameCount >= pointingConfirmFrames
+            bgPalmFrameCount     = 0
+            bgThumbsUpFrameCount = 0
+            bgPointingFrameCount = 0
+            if wasPalm || wasPointing {
+                Task { @MainActor [weak self] in
+                    if self?.pointingGestureActive == true {
+                        self?.pointingGestureActive = false
+                    }
+                    if wasPalm {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        self?.palmGuideBbox    = nil
+                        self?.palmGestureActive = false
+                    }
+                }
+            }
+            return
+        }
+
+        // ── Thumbs-up: lock/unlock ────────────────────────────────────────────
+        if isThumbsUp(obs) {
+            bgThumbsUpFrameCount = min(bgThumbsUpFrameCount + 1, thumbsUpConfirmFrames + 1)
+            bgPalmFrameCount     = 0
+            bgPointingFrameCount = 0
+            if bgThumbsUpFrameCount == thumbsUpConfirmFrames {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.followLocked.toggle()
+                    self.palmGestureActive    = false
+                    self.pointingGestureActive = false
+                    self.palmGuideBbox        = nil
+                    self.logger.info("GESTURE: followLocked=\(self.followLocked)")
+                }
+            }
+            return
+        }
+        bgThumbsUpFrameCount = 0
+
+        // ── Pointing: rotate toward pointed direction, search for subject ─────
+        if let tipPos = pointingTip(obs),
+           let pts    = try? obs.recognizedPoints(.all),
+           let wrist  = pts[.wrist], wrist.confidence > 0.5
+        {
+            bgPointingFrameCount = min(bgPointingFrameCount + 1, pointingConfirmFrames + 1)
+            bgPalmFrameCount     = 0
+            if bgPointingFrameCount >= pointingConfirmFrames {
+                // Direction vector in image-normalised coords (Vision: y up, x right)
+                let dx = tipPos.x - wrist.location.x
+                let dy = tipPos.y - wrist.location.y
+                bgPointingFrameCount = 0   // reset so subsequent points trigger again
+                Task { @MainActor [weak self] in
+                    self?.startPointSeek(dx: dx, dy: dy)
+                }
+            }
+            return
+        }
+        bgPointingFrameCount = 0
+
+        // ── Open palm: redirect follow (existing behaviour) ───────────────────
+        guard isOpenPalm(obs),
+              let points = try? obs.recognizedPoints(.all),
+              let wrist  = points[.wrist], wrist.confidence > 0.5 else {
             let wasGuiding = bgPalmFrameCount >= palmConfirmFrames
             bgPalmFrameCount = 0
             if wasGuiding {
-                // Palm dropped — hold the last aim point briefly, then clear both
-                // guide and active flag together so updateBbox can hand off cleanly.
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    self?.palmGuideBbox = nil
+                    self?.palmGuideBbox    = nil
                     self?.palmGestureActive = false
+                    // Open palm after lock = unlock
+                    self?.followLocked     = false
                 }
             }
             return
@@ -1226,8 +1557,6 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         bgPalmFrameCount = min(bgPalmFrameCount + 1, palmConfirmFrames + 1)
         guard bgPalmFrameCount >= palmConfirmFrames else { return }
 
-        // Build a small synthetic bbox centered on the wrist (palm anchor point).
-        // Vision coords: origin bottom-left, Y increasing upward — same as detectedBbox.
         let cx = wrist.location.x
         let cy = wrist.location.y
         let size: CGFloat = 0.08
@@ -1235,11 +1564,171 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         Task { @MainActor [weak self] in
             guard let self, self.isRunning else { return }
-            self.palmGuideBbox = synthBbox
-            self.palmGestureActive = true
-            // If follow isn't running, start it so the gimbal actually moves
+            self.palmGuideBbox        = synthBbox
+            self.palmGestureActive    = true
+            self.pointingGestureActive = false
+            self.followLocked         = false
             if !self.isFollowing { self.startFollow() }
         }
+    }
+
+    // MARK: - Point-and-seek state machine
+    //
+    // Triggered when the user holds a pointing gesture for ≥pointingConfirmFrames.
+    //   1. Translate the (tip - wrist) vector into a yaw/pitch delta and rotate
+    //      the gimbal toward that direction.
+    //   2. After arriving (~700 ms), watch for a face/body for up to 2.5 s.
+    //   3. If a subject appears → start follow on it.
+    //   4. If nothing appears in time → rotate back to the original position
+    //      and restore the prior follow state.
+
+    /// Maximum yaw swing for a full-image-width finger vector (degrees).
+    private static let pointSeekYawScale:   Double = 90
+    private static let pointSeekPitchScale: Double = 45
+    /// How long to wait at the destination before giving up (seconds).
+    private static let pointSeekSearchSec:  TimeInterval = 2.5
+    /// Approximate rotate-arrival delay so we don't try to detect faces mid-swing.
+    private static let pointSeekArrivalSec: TimeInterval = 0.75
+    /// Time the rotate-home animation takes before we declare seek complete.
+    private static let pointSeekReturnSec:  TimeInterval = 0.75
+
+    @MainActor
+    func startPointSeek(dx: CGFloat, dy: CGFloat) {
+        guard isRunning, pointSeekPhase == .idle else { return }
+
+        // Need a meaningful direction — ignore tiny vectors (false positives).
+        let mag = sqrt(dx * dx + dy * dy)
+        guard mag > 0.10 else { return }
+
+        // Snapshot current gimbal position to restore on failure
+        let cur = getCurrentPosition?() ?? GimbalPosition()
+        pointSeekHomeYaw      = cur.yaw
+        pointSeekHomePitch    = cur.pitch
+        pointSeekWasFollowing = isFollowing
+        pointingGestureActive = true
+        pointSeekPhase        = .rotating
+        pointSeekPhaseStart   = Date()
+
+        // Convert finger vector → yaw/pitch delta. Vision X: 0→1 left→right.
+        // Vision Y: 0→1 bottom→top → positive dy = up = positive pitch.
+        let yawDelta   = Double(dx) * Self.pointSeekYawScale
+        let pitchDelta = Double(dy) * Self.pointSeekPitchScale
+        let targetYaw   = max(-160, min(160, cur.yaw   + yawDelta))
+        let targetPitch = max(-35,  min(35,  cur.pitch + pitchDelta))
+
+        // Pause active follow while seek runs
+        if isFollowing { stopFollow() }
+        followLocked = false
+
+        logger.info("POINT-SEEK: home=\(cur.yaw)°,\(cur.pitch)° → \(targetYaw)°,\(targetPitch)° (dx=\(dx) dy=\(dy))")
+        // time=70 → ~700 ms gimbal-side animation; sim respects this directly.
+        onAbsoluteMove?(targetYaw, targetPitch, 70)
+
+        // Drive the phase machine at 5 Hz
+        pointSeekTimer?.invalidate()
+        pointSeekTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.tickPointSeek() }
+        }
+    }
+
+    @MainActor
+    private func tickPointSeek() {
+        guard pointSeekPhase != .idle, let start = pointSeekPhaseStart else { return }
+        let elapsed = Date().timeIntervalSince(start)
+
+        switch pointSeekPhase {
+        case .rotating:
+            if elapsed >= Self.pointSeekArrivalSec {
+                pointSeekPhase      = .searching
+                pointSeekPhaseStart = Date()
+                logger.info("POINT-SEEK: arrived, searching for subject")
+            }
+
+        case .searching:
+            // Subject appeared? Lock onto it.
+            let foundSubject = !allSubjects.isEmpty || detectedBbox != nil
+            if foundSubject {
+                logger.info("POINT-SEEK: subject found — starting follow")
+                cleanupPointSeek()
+                if !isFollowing { startFollow() }
+                return
+            }
+            // Time's up — go home.
+            if elapsed >= Self.pointSeekSearchSec {
+                logger.info("POINT-SEEK: nothing found → returning to \(self.pointSeekHomeYaw)°,\(self.pointSeekHomePitch)°")
+                pointSeekPhase      = .returning
+                pointSeekPhaseStart = Date()
+                onAbsoluteMove?(pointSeekHomeYaw, pointSeekHomePitch, 70)
+            }
+
+        case .returning:
+            if elapsed >= Self.pointSeekReturnSec {
+                let restoreFollow = pointSeekWasFollowing
+                cleanupPointSeek()
+                if restoreFollow { startFollow() }
+            }
+
+        case .idle:
+            break
+        }
+    }
+
+    @MainActor
+    private func cleanupPointSeek() {
+        pointSeekTimer?.invalidate()
+        pointSeekTimer        = nil
+        pointSeekPhase        = .idle
+        pointSeekPhaseStart   = nil
+        pointSeekWasFollowing = false
+        pointingGestureActive = false
+    }
+
+    /// Returns true when the hand looks like a thumbs-up:
+    /// thumb tip clearly above wrist, all other fingertips folded near the wrist.
+    nonisolated private func isThumbsUp(_ obs: VNHumanHandPoseObservation) -> Bool {
+        guard let points   = try? obs.recognizedPoints(.all) else { return false }
+        guard let wrist    = points[.wrist],    wrist.confidence    > 0.5 else { return false }
+        guard let thumbTip = points[.thumbTip], thumbTip.confidence > 0.5 else { return false }
+
+        // Thumb must point clearly upward (Vision Y: 0=bottom, 1=top)
+        guard thumbTip.location.y > wrist.location.y + 0.12 else { return false }
+
+        // Other fingertips must be folded (close to wrist)
+        let others: [VNHumanHandPoseObservation.JointName] = [.indexTip, .middleTip, .ringTip, .littleTip]
+        var folded = 0
+        for joint in others {
+            guard let tip = points[joint], tip.confidence > 0.5 else { folded += 1; continue }
+            let dx = tip.location.x - wrist.location.x
+            let dy = tip.location.y - wrist.location.y
+            if sqrt(dx * dx + dy * dy) < 0.15 { folded += 1 }
+        }
+        return folded >= 3
+    }
+
+    /// Returns the index fingertip position (Vision coords) when the hand is pointing
+    /// (index extended, middle/ring/little folded).  Returns nil otherwise.
+    nonisolated private func pointingTip(_ obs: VNHumanHandPoseObservation) -> CGPoint? {
+        guard let points   = try? obs.recognizedPoints(.all) else { return nil }
+        guard let wrist    = points[.wrist],    wrist.confidence    > 0.5 else { return nil }
+        guard let indexTip = points[.indexTip], indexTip.confidence > 0.5 else { return nil }
+
+        // Index must be extended
+        let idx_dx = indexTip.location.x - wrist.location.x
+        let idx_dy = indexTip.location.y - wrist.location.y
+        guard sqrt(idx_dx * idx_dx + idx_dy * idx_dy) > 0.14 else { return nil }
+
+        // Middle, ring, little must be folded
+        let others: [VNHumanHandPoseObservation.JointName] = [.middleTip, .ringTip, .littleTip]
+        var folded = 0
+        for joint in others {
+            guard let tip = points[joint], tip.confidence > 0.4 else { folded += 1; continue }
+            let dx = tip.location.x - wrist.location.x
+            let dy = tip.location.y - wrist.location.y
+            if sqrt(dx * dx + dy * dy) < 0.14 { folded += 1 }
+        }
+        guard folded >= 2 else { return nil }
+
+        return indexTip.location
     }
 
     /// Returns true if the observation looks like an open palm:

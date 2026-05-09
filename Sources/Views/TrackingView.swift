@@ -17,118 +17,1488 @@ extension Color {
     }
 }
 
-// MARK: - Neobrutalist card modifier
+// MARK: - Design tokens
 
-private struct BrutalCard: ViewModifier {
-    let borderColor: Color
-    let lineWidth: CGFloat
+private enum DS {
+    static let bg       = Color(hex: "0A0A0A")
+    static let surface  = Color(hex: "111111")
+    static let surface2 = Color(hex: "0D0D0D")
+    static let yellow   = Color(hex: "FFE500")
+    static let green    = Color(hex: "39FF14")
+    static let cyan     = Color(hex: "00FFFF")
+    static let orange   = Color(hex: "FF6B2B")
+    static let purple   = Color(hex: "C77DFF")
+    static let border   = Color(hex: "FFE500").opacity(0.25)
+    static let divider  = Color(hex: "FFE500").opacity(0.18)
 
-    func body(content: Content) -> some View {
-        content
-            .background(Color.black)
-            .overlay(
-                Rectangle()
-                    .stroke(borderColor, lineWidth: lineWidth)
-            )
+    static func modeColor(_ mode: ObservationMode) -> Color {
+        switch mode {
+        case .shot:     return cyan
+        case .presence: return purple
+        case .moment:   return orange
+        }
     }
 }
 
-extension View {
-    func brutalCard(_ color: Color, lineWidth: CGFloat = 2) -> some View {
-        modifier(BrutalCard(borderColor: color, lineWidth: lineWidth))
+// MARK: - Root view
+
+/// Tab kinds rendered inside the OperatorSidebar's swappable middle pane.
+private enum SidebarTab: String, CaseIterable {
+    case ai      = "AI"
+    case connect = "CONNECT"
+    case presets = "PRESETS"
+    case manual  = "MANUAL"
+
+    var icon: String {
+        switch self {
+        case .ai:      return "sparkles"
+        case .connect: return "antenna.radiowaves.left.and.right"
+        case .presets: return "bookmark.fill"
+        case .manual:  return "gamecontroller.fill"
+        }
     }
 }
-
-// MARK: - Main TrackingView
 
 struct TrackingView: View {
-    @ObservedObject var gimbal: GimbalService
+    @ObservedObject var gimbal:  GimbalService
     @ObservedObject var tracker: CameraTracker
-
-    @State private var showSettings = false
+    @ObservedObject var presets: PresetsManager
+    @State private var selectedTab: SidebarTab = .ai
 
     var body: some View {
-        ScrollView {
+        HStack(alignment: .top, spacing: 0) {
+
+            // ── Left column: pure visual — stream + dynamic canvas ───
             VStack(spacing: 0) {
+                StreamPane(gimbal: gimbal, tracker: tracker)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                // ── 1. CAMERA STRIP ──────────────────────────────────────────
-                CameraStripSection(gimbal: gimbal, tracker: tracker,
-                                   showSettings: $showSettings)
+                Rectangle().fill(DS.divider).frame(height: 1)
 
-                // ── 2. INTELLIGENCE PANEL ────────────────────────────────────
-                HStack(alignment: .top, spacing: 0) {
-                    RoomCardSection(gimbal: gimbal, tracker: tracker)
-                        .frame(maxWidth: .infinity)
-
-                    Rectangle()
-                        .fill(Color(hex: "FFE500"))
-                        .frame(width: 1)
-
-                    FollowCardSection(tracker: tracker)
-                        .frame(maxWidth: .infinity)
-                }
-                .frame(minHeight: 260)
-                .brutalCard(Color(hex: "FFE500"), lineWidth: 2)
-                .padding(.top, 2)
-
-                // ── 3. OBSERVE STRIP ─────────────────────────────────────────
-                ObserveStrip(tracker: tracker)
-                    .padding(.top, 2)
-
-                // ── 4. NARRATIVE PANEL ───────────────────────────────────────
-                NarrativePanel(tracker: tracker)
-                    .padding(.top, 2)
-
-                // ── 5. CAPTURE ROW ───────────────────────────────────────────
-                CaptureRow(tracker: tracker)
-                    .padding(.top, 2)
-
-                // ── SETTINGS (collapsible) ───────────────────────────────────
-                if showSettings {
-                    SettingsPanel(tracker: tracker, gimbal: gimbal)
-                        .padding(.top, 2)
-                }
-
+                DynamicCanvas(gimbal: gimbal, tracker: tracker)
+                    .frame(maxWidth: .infinity, minHeight: 160, maxHeight: 220)
             }
-            .padding(8)
-            .background(Color(hex: "0A0A0A"))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Rectangle().fill(DS.yellow).frame(width: 1)
+
+            // ── Right column: full operator console ──────────────────
+            OperatorSidebar(
+                gimbal:  gimbal,
+                tracker: tracker,
+                presets: presets,
+                selectedTab: $selectedTab
+            )
+            .frame(width: 300)
+            .frame(maxHeight: .infinity)
         }
-        .background(Color(hex: "0A0A0A"))
-        .frame(minWidth: 340)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 720, minHeight: 540)
+        .background(DS.bg)
         .onAppear {
             tracker.onSpeedCommand = { [weak gimbal] yaw, pitch in
                 gimbal?.setSpeed(yaw: yaw, pitch: pitch, roll: 0)
             }
+            tracker.claudeAgent.connect(gimbal: gimbal, tracker: tracker)
         }
-    }
-
-    private var recordingLabel: String {
-        let total = Int(tracker.recordingDuration)
-        let m = total / 60
-        let s = total % 60
-        return String(format: "%d:%02d", m, s)
     }
 }
 
-// MARK: - Camera Strip
+// MARK: - Operator sidebar (status + tabbed middle + always-on controls)
 
-private struct CameraStripSection: View {
-    @ObservedObject var gimbal: GimbalService
+private struct OperatorSidebar: View {
+    @ObservedObject var gimbal:  GimbalService
     @ObservedObject var tracker: CameraTracker
-    @Binding var showSettings: Bool
+    @ObservedObject var presets: PresetsManager
+    @Binding var selectedTab: SidebarTab
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header bar
+            StatusBar(gimbal: gimbal, tracker: tracker)
+                .frame(height: 42)
+            Rectangle().fill(DS.divider).frame(height: 1)
+
+            // Tab strip — switches the swappable pane below
+            TabStrip(selected: $selectedTab)
+                .frame(height: 32)
+            Rectangle().fill(DS.divider).frame(height: 1)
+
+            // Swappable pane: content depends on selected tab
+            Group {
+                switch selectedTab {
+                case .ai:      AIPane(tracker: tracker)
+                case .connect: ConnectPane(gimbal: gimbal)
+                case .presets: PresetsPane(gimbal: gimbal, presets: presets)
+                case .manual:  ManualPane(gimbal: gimbal)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Rectangle().fill(DS.divider).frame(height: 1)
+
+            // ── Always-on controls (these stay visible in every tab) ──
+            FollowButton(gimbal: gimbal, tracker: tracker)
+                .frame(height: 56)
+            Rectangle().fill(DS.divider).frame(height: 1)
+
+            QuickActions(gimbal: gimbal, tracker: tracker)
+                .frame(height: 44)
+            Rectangle().fill(DS.divider.opacity(0.6)).frame(height: 1)
+
+            CaptureRow(tracker: tracker)
+                .frame(height: 40)
+        }
+    }
+}
+
+// MARK: - Tab strip
+
+private struct TabStrip: View {
+    @Binding var selected: SidebarTab
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(SidebarTab.allCases, id: \.self) { tab in
+                Button { selected = tab } label: {
+                    VStack(spacing: 2) {
+                        Image(systemName: tab.icon)
+                            .font(.system(size: 11))
+                        Text(tab.rawValue)
+                            .font(.system(size: 8, weight: .black, design: .monospaced))
+                            .tracking(1)
+                    }
+                    .foregroundColor(selected == tab ? .black : .white.opacity(0.45))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(selected == tab ? DS.yellow : DS.surface2)
+                    .overlay(
+                        Rectangle()
+                            .fill(DS.yellow)
+                            .frame(height: 2)
+                            .opacity(selected == tab ? 1 : 0),
+                        alignment: .top
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .background(DS.surface2)
+    }
+}
+
+// MARK: - AI pane (the existing InsightCard + CommandBox stack)
+
+private struct AIPane: View {
+    @ObservedObject var tracker: CameraTracker
+
+    var body: some View {
+        VStack(spacing: 0) {
+            InsightCard(tracker: tracker)
+                .frame(minHeight: 200, maxHeight: 260)
+            Rectangle().fill(DS.divider).frame(height: 1)
+            CommandBox(tracker: tracker)
+                .frame(maxHeight: .infinity)
+        }
+    }
+}
+
+// MARK: - Connect pane (BLE scan + connect)
+
+private struct ConnectPane: View {
+    @ObservedObject var gimbal: GimbalService
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Status header
             HStack(spacing: 8) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                Text(gimbal.state.connectionState.statusText.uppercased())
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .tracking(1)
+                    .foregroundColor(.white.opacity(0.85))
+                Spacer()
+                if gimbal.state.connectionState.isConnected {
+                    BatteryStatusView(battery: gimbal.state.battery)
+                        .font(.system(size: 11, design: .monospaced))
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(DS.surface2)
+
+            // Scan + device list
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    if case .scanning = gimbal.state.connectionState {
+                        Button("STOP SCAN") { gimbal.stopScan() }
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Color.orange)
+                            .buttonStyle(.plain)
+                    } else if gimbal.state.connectionState.isConnected {
+                        Button("DISCONNECT") { gimbal.disconnect() }
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Color.orange)
+                            .buttonStyle(.plain)
+                    } else {
+                        Button("SCAN") { gimbal.startScan() }
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(DS.yellow)
+                            .buttonStyle(.plain)
+                            .disabled(gimbal.isSimulator)
+                            .opacity(gimbal.isSimulator ? 0.4 : 1)
+                    }
+                    if gimbal.isSimulator {
+                        Text("SIM ON — toggle off in ⚙ first")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(DS.purple.opacity(0.8))
+                    }
+                    Spacer()
+                }
+
+                Text("DISCOVERED")
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .tracking(2)
+                    .foregroundColor(.white.opacity(0.4))
+
+                if gimbal.state.discoveredDevices.isEmpty {
+                    Text("(no devices yet — tap SCAN)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.3))
+                } else {
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            ForEach(gimbal.state.discoveredDevices) { dev in
+                                Button { gimbal.connect(to: dev) } label: {
+                                    HStack {
+                                        Image(systemName: "antenna.radiowaves.left.and.right")
+                                            .font(.system(size: 11))
+                                        Text(dev.name)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text("\(dev.rssi) dBm")
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundColor(.white.opacity(0.4))
+                                    }
+                                    .foregroundColor(.white.opacity(0.85))
+                                    .padding(.horizontal, 8).padding(.vertical, 6)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(DS.surface)
+                                    .overlay(Rectangle().stroke(DS.divider, lineWidth: 1))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(DS.bg)
+        }
+    }
+
+    private var statusColor: Color {
+        switch gimbal.state.connectionState {
+        case .ready: return DS.green
+        case .scanning, .connecting, .discoveringServices: return Color.orange
+        case .error: return Color.red
+        case .disconnected: return Color.white.opacity(0.3)
+        }
+    }
+}
+
+// MARK: - Presets pane
+
+private struct PresetsPane: View {
+    @ObservedObject var gimbal:  GimbalService
+    @ObservedObject var presets: PresetsManager
+    @State private var newName: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Save current position bar
+            HStack(spacing: 6) {
+                Image(systemName: "plus.circle")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.yellow.opacity(0.7))
+                TextField("name…", text: $newName)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.white)
+                    .onSubmit(savePreset)
+                Button("SAVE") { savePreset() }
+                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(newName.isEmpty ? DS.yellow.opacity(0.3) : DS.yellow)
+                    .buttonStyle(.plain)
+                    .disabled(newName.isEmpty)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 8)
+            .background(DS.surface2)
+            Rectangle().fill(DS.divider).frame(height: 1)
+
+            // Preset list
+            if presets.allPresets.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "bookmark")
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.12))
+                    Text("NO PRESETS YET")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .tracking(2)
+                        .foregroundColor(.white.opacity(0.3))
+                    Text("Save the current gimbal position above.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.25))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(DS.bg)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(presets.allPresets) { preset in
+                            HStack {
+                                Image(systemName: preset.isBuiltIn ? "bookmark" : "bookmark.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(preset.isBuiltIn ? .white.opacity(0.4) : DS.cyan.opacity(0.7))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(preset.name)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(.white.opacity(0.9))
+                                    Text(String(format: "%+.0f°, %+.0f°", preset.yaw, preset.pitch))
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundColor(.white.opacity(0.4))
+                                }
+                                Spacer()
+                                Button {
+                                    gimbal.absoluteRotate(yaw: preset.yaw, pitch: preset.pitch, time: preset.transitionTime)
+                                } label: {
+                                    Image(systemName: "arrow.right.circle.fill")
+                                        .font(.system(size: 17))
+                                        .foregroundColor(DS.cyan)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(!gimbal.state.connectionState.isConnected)
+                                .opacity(gimbal.state.connectionState.isConnected ? 1 : 0.3)
+                                .help("Go to preset")
+                                if !preset.isBuiltIn {
+                                    Button { presets.delete(preset) } label: {
+                                        Image(systemName: "trash")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.white.opacity(0.35))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Delete")
+                                }
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(DS.surface)
+                            .overlay(Rectangle().fill(DS.divider).frame(height: 1), alignment: .bottom)
+                        }
+                    }
+                }
+                .background(DS.bg)
+            }
+        }
+    }
+
+    private func savePreset() {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pos = gimbal.state.currentPosition
+        presets.savePosition(name: trimmed, yaw: pos.yaw, pitch: pos.pitch, roll: pos.roll)
+        newName = ""
+    }
+}
+
+// MARK: - Manual pane (direct controls + joystick)
+
+private struct ManualPane: View {
+    @ObservedObject var gimbal: GimbalService
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Recenter row
+            HStack(spacing: 8) {
+                Button {
+                    gimbal.recenter()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "scope").font(.system(size: 13))
+                        Text("RECENTER")
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .tracking(1)
+                    }
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(DS.yellow)
+                }
+                .buttonStyle(.plain)
+                .disabled(!gimbal.state.connectionState.isConnected)
+
+                Button {
+                    gimbal.setSpeed(yaw: 0, pitch: 0, roll: 0)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "stop.fill").font(.system(size: 13))
+                        Text("STOP")
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .tracking(1)
+                    }
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(DS.surface)
+                    .overlay(Rectangle().stroke(.white.opacity(0.2), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+            }
+
+            // Quick rotation arrows
+            VStack(spacing: 4) {
+                HStack(spacing: 4) {
+                    Spacer()
+                    rotateButton(icon: "arrow.up", deltaYaw: 0, deltaPitch: 15)
+                    Spacer()
+                }
+                HStack(spacing: 4) {
+                    rotateButton(icon: "arrow.left",      deltaYaw: -30, deltaPitch: 0)
+                    rotateButton(icon: "circle",          deltaYaw: 0,   deltaPitch: 0,
+                                 label: "0°", absolute: true)
+                    rotateButton(icon: "arrow.right",     deltaYaw: 30,  deltaPitch: 0)
+                }
+                HStack(spacing: 4) {
+                    Spacer()
+                    rotateButton(icon: "arrow.down", deltaYaw: 0, deltaPitch: -15)
+                    Spacer()
+                }
+            }
+
+            // Position readout
+            VStack(alignment: .leading, spacing: 4) {
+                Text("POSITION")
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .tracking(2)
+                    .foregroundColor(.white.opacity(0.4))
+                Text(String(format: "Yaw  %+6.1f°", gimbal.state.currentPosition.yaw))
+                    .font(.system(size: 13, design: .monospaced).monospacedDigit())
+                    .foregroundColor(DS.yellow)
+                Text(String(format: "Pitch %+6.1f°", gimbal.state.currentPosition.pitch))
+                    .font(.system(size: 13, design: .monospaced).monospacedDigit())
+                    .foregroundColor(DS.yellow)
+            }
+
+            Spacer()
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(DS.bg)
+    }
+
+    @ViewBuilder
+    private func rotateButton(
+        icon: String, deltaYaw: Double, deltaPitch: Double,
+        label: String? = nil, absolute: Bool = false
+    ) -> some View {
+        Button {
+            if absolute {
+                gimbal.recenter()
+            } else {
+                let cur = gimbal.state.currentPosition
+                gimbal.absoluteRotate(
+                    yaw:   max(-160, min(160, cur.yaw   + deltaYaw)),
+                    pitch: max(-35,  min(35,  cur.pitch + deltaPitch)),
+                    time:  40
+                )
+            }
+        } label: {
+            VStack(spacing: 1) {
+                Image(systemName: icon).font(.system(size: 16))
+                if let label {
+                    Text(label).font(.system(size: 8, design: .monospaced))
+                }
+            }
+            .foregroundColor(.white.opacity(0.85))
+            .frame(width: 60, height: 44)
+            .background(DS.surface)
+            .overlay(Rectangle().stroke(.white.opacity(0.2), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(!gimbal.state.connectionState.isConnected)
+        .opacity(gimbal.state.connectionState.isConnected ? 1 : 0.4)
+    }
+}
+
+// MARK: - Primary FOLLOW button
+
+private struct FollowButton: View {
+    @ObservedObject var gimbal:  GimbalService
+    @ObservedObject var tracker: CameraTracker
+
+    var body: some View {
+        Button {
+            if tracker.isFollowing { tracker.stopFollow() }
+            else if gimbal.state.connectionState.isConnected { tracker.startFollow() }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: tracker.isFollowing ? "viewfinder.circle.fill" : "viewfinder.circle")
+                    .font(.system(size: 18))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(tracker.isFollowing ? "FOLLOWING" : "FOLLOW")
+                        .font(.system(size: 12, weight: .black, design: .monospaced))
+                        .tracking(2)
+                    if tracker.followLocked {
+                        Text("LOCKED")
+                            .font(.system(size: 7, weight: .black, design: .monospaced))
+                            .foregroundColor(DS.yellow)
+                    } else if !tracker.isFollowing {
+                        Text(canFollow ? "TAP TO START" : disabledReason)
+                            .font(.system(size: 7, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.45))
+                    }
+                }
+                Spacer()
+                if tracker.isFollowing {
+                    Image(systemName: tracker.followLocked ? "lock.fill" : "lock.open")
+                        .font(.system(size: 11))
+                        .foregroundColor(tracker.followLocked ? DS.yellow : .black.opacity(0.3))
+                }
+            }
+            .foregroundColor(tracker.isFollowing ? .black : DS.cyan)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(tracker.isFollowing ? DS.cyan : DS.cyan.opacity(0.08))
+            .overlay(Rectangle().stroke(DS.cyan.opacity(tracker.isFollowing ? 0 : 0.4), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(!canFollow)
+        .opacity(canFollow ? 1 : 0.45)
+    }
+
+    private var canFollow: Bool {
+        tracker.isRunning && gimbal.state.connectionState.isConnected
+            && tracker.roomSweepState != .sweeping
+    }
+
+    private var disabledReason: String {
+        if !tracker.isRunning                      { return "START CAMERA FIRST" }
+        if !gimbal.state.connectionState.isConnected { return "CONNECT GIMBAL" }
+        if tracker.roomSweepState == .sweeping     { return "WAIT FOR SCAN" }
+        return ""
+    }
+}
+
+// MARK: - Quick actions row
+
+private struct QuickActions: View {
+    @ObservedObject var gimbal:  GimbalService
+    @ObservedObject var tracker: CameraTracker
+    @ObservedObject private var journal: JournalAnalyzer
+
+    init(gimbal: GimbalService, tracker: CameraTracker) {
+        self.gimbal  = gimbal
+        self.tracker = tracker
+        self.journal = tracker.journalAnalyzer
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // START / STOP camera
+            Button(tracker.isRunning ? "STOP" : "START") {
+                if tracker.isRunning { tracker.stopCamera() } else { tracker.startCamera() }
+            }
+            .font(.system(size: 11, weight: .black, design: .monospaced))
+            .tracking(1)
+            .foregroundColor(.black)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(tracker.isRunning ? Color.orange : DS.yellow)
+            .buttonStyle(.plain)
+
+            // ANALYZE
+            let runner = journal.runner
+            Button {
+                if journal.isAnalyzing {
+                    journal.stop()
+                } else {
+                    if !runner.isReady { runner.start() }
+                    if runner.isReady {
+                        journal.start(tracker: tracker, transcriber: tracker.transcriber)
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: journal.isAnalyzing ? "stop.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 13))
+                    Text(journal.isAnalyzing ? "STOP AI" : "ANALYZE")
+                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .tracking(1)
+                }
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(journal.isAnalyzing ? Color.orange : DS.yellow)
+            }
+            .buttonStyle(.plain)
+            .disabled(!tracker.isRunning && !journal.isAnalyzing)
+            .opacity(tracker.isRunning || journal.isAnalyzing ? 1 : 0.4)
+
+            // SCAN ROOM
+            Button {
+                tracker.scanRoom()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: tracker.roomSweepState == .sweeping ? "stop.circle" : "scope")
+                        .font(.system(size: 13))
+                    Text(tracker.roomSweepState == .sweeping ? "SCANNING" : "SCAN")
+                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .tracking(1)
+                }
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(tracker.roomSweepState == .sweeping ? Color.orange : DS.green)
+            }
+            .buttonStyle(.plain)
+            .disabled(!tracker.isRunning || !gimbal.state.connectionState.isConnected)
+            .opacity(tracker.isRunning && gimbal.state.connectionState.isConnected ? 1 : 0.4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(DS.surface2)
+    }
+}
+
+// MARK: - Capture row (photo / rec / files)
+
+private struct CaptureRow: View {
+    @ObservedObject var tracker: CameraTracker
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Photo
+            Button { tracker.capturePhoto() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "camera").font(.system(size: 13))
+                    Text("PHOTO").font(.system(size: 10, weight: .black, design: .monospaced))
+                }
+                .foregroundColor(.white.opacity(0.85))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(DS.surface)
+                .overlay(Rectangle().stroke(.white.opacity(0.18), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .disabled(!tracker.isRunning)
+            .opacity(tracker.isRunning ? 1 : 0.4)
+
+            // Record
+            Button {
+                if tracker.isRecording { tracker.stopRecording() }
+                else                   { tracker.startRecording() }
+            } label: {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(tracker.isRecording ? Color.red : .white.opacity(0.7))
+                        .frame(width: 9, height: 9)
+                    Text(tracker.isRecording ? recLabel : "REC")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .monospacedDigit()
+                }
+                .foregroundColor(tracker.isRecording ? .white : .white.opacity(0.85))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(tracker.isRecording ? Color.red.opacity(0.35) : DS.surface)
+                .overlay(Rectangle().stroke(tracker.isRecording ? Color.red.opacity(0.7) : .white.opacity(0.18), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .disabled(!tracker.isRunning || tracker.isTimelapsing)
+            .opacity(tracker.isRunning && !tracker.isTimelapsing ? 1 : 0.4)
+
+            // Timelapse
+            Button {
+                if tracker.isTimelapsing { tracker.stopTimelapse() }
+                else                     { tracker.startTimelapse() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: tracker.isTimelapsing ? "stopwatch.fill" : "stopwatch")
+                        .font(.system(size: 12))
+                    Text(tracker.isTimelapsing ? tlpLabel : "TLP")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .monospacedDigit()
+                }
+                .foregroundColor(tracker.isTimelapsing ? .black : .white.opacity(0.85))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(tracker.isTimelapsing ? DS.purple : DS.surface)
+                .overlay(Rectangle().stroke(tracker.isTimelapsing ? DS.purple : .white.opacity(0.18), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .disabled(!tracker.isRunning || tracker.isRecording)
+            .opacity(tracker.isRunning && !tracker.isRecording ? 1 : 0.4)
+            .help("Capture a timelapse — every \(Int(tracker.timelapseInterval))s")
+
+            // Files menu
+            Menu {
+                if let url = tracker.lastPhotoURL {
+                    Button("Last Photo") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                }
+                if let url = tracker.lastVideoURL {
+                    Button("Last Video") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                }
+                Button("Open Captures Folder") { NSWorkspace.shared.open(gimbalCapturesDir) }
+                if let path = tracker.journalAnalyzer.currentSessionPath {
+                    Button("Open Journal Log") {
+                        NSWorkspace.shared.activateFileViewerSelecting([path])
+                    }
+                }
+            } label: {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(.white.opacity(0.65))
+                    .frame(maxHeight: .infinity)
+                    .frame(width: 46)
+                    .background(DS.surface)
+                    .overlay(Rectangle().stroke(.white.opacity(0.18), lineWidth: 1))
+            }
+            .menuStyle(.borderlessButton)
+            .frame(width: 46)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(DS.surface2)
+    }
+
+    private var recLabel: String {
+        let t = Int(tracker.recordingDuration)
+        return String(format: "%d:%02d", t / 60, t % 60)
+    }
+
+    /// Compact label for the active timelapse: shows frame count + elapsed wall time.
+    private var tlpLabel: String {
+        let f = tracker.timelapseFrameCount
+        let t = Int(tracker.timelapseDuration)
+        return "\(f)·\(t)s"
+    }
+}
+
+// MARK: - AI Command box (Claude natural-language control)
+
+private struct CommandBox: View {
+    @ObservedObject var tracker: CameraTracker
+    @ObservedObject private var agent: ClaudeAgent
+    @State private var input: String = ""
+    @State private var showHistory: Bool = true
+    @FocusState private var inputFocused: Bool
+
+    init(tracker: CameraTracker) {
+        self.tracker = tracker
+        self.agent   = tracker.claudeAgent
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12))
+                    .foregroundColor(agent.isConfigured ? DS.yellow : .white.opacity(0.25))
+                Text("COMMAND")
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .tracking(2)
+                    .foregroundColor(agent.isConfigured ? DS.yellow : .white.opacity(0.35))
+                if agent.isThinking {
+                    ProgressView().scaleEffect(0.5).tint(DS.yellow)
+                }
+                Spacer()
+                if !agent.messages.isEmpty {
+                    Button { agent.clearHistory() } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.4))
+                            .frame(width: 24, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear chat")
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(DS.surface2)
+
+            // Conversation history
+            if !agent.isConfigured {
+                missingKeyView
+            } else if agent.messages.isEmpty {
+                emptyHintView
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(agent.messages) { msg in
+                                ChatBubble(msg: msg).id(msg.id)
+                            }
+                            if let err = agent.lastError {
+                                Text(err)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundColor(.orange)
+                                    .padding(.horizontal, 6).padding(.vertical, 3)
+                                    .background(Color.orange.opacity(0.1))
+                            }
+                            Color.clear.frame(height: 1).id("bottom")
+                        }
+                        .padding(8)
+                    }
+                    .onChange(of: agent.messages.count) { _, _ in
+                        withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(DS.bg)
+            }
+
+            // Input
+            HStack(spacing: 8) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(DS.yellow.opacity(0.7))
+                TextField("ask claude to do anything…", text: $input)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundColor(.white)
+                    .focused($inputFocused)
+                    .onSubmit { submit() }
+                    .disabled(!agent.isConfigured || agent.isThinking)
+                if !input.isEmpty {
+                    Button { submit() } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundColor(DS.yellow)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 40)
+            .background(DS.surface)
+            .overlay(Rectangle().fill(DS.divider).frame(height: 1), alignment: .top)
+        }
+    }
+
+    private func submit() {
+        let s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return }
+        agent.send(s)
+        input = ""
+    }
+
+    @ViewBuilder
+    private var missingKeyView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(.orange)
+                Text("CLAUDE CLI NOT FOUND")
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .foregroundColor(.orange)
+            }
+            Text("Install Claude Code, then re-launch this app:")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.white.opacity(0.65))
+                .fixedSize(horizontal: false, vertical: true)
+            Text("npm i -g @anthropic-ai/claude-code")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(DS.yellow)
+                .textSelection(.enabled)
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DS.surface)
+            Text("Then run `claude login` in your terminal.")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.white.opacity(0.45))
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(DS.bg)
+    }
+
+    @ViewBuilder
+    private var emptyHintView: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("TRY ASKING")
+                .font(.system(size: 10, weight: .black, design: .monospaced))
+                .tracking(2)
+                .foregroundColor(.white.opacity(0.4))
+            ForEach([
+                "scan the room, then look at Alice",
+                "rotate 30° left and take a photo",
+                "follow whoever is talking",
+                "lock here, then start recording",
+                "what do you see right now?"
+            ], id: \.self) { hint in
+                Button { input = hint; inputFocused = true } label: {
+                    Text("→ \(hint)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(DS.yellow.opacity(0.65))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                .help("Click to fill")
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(DS.bg)
+    }
+}
+
+private struct ChatBubble: View {
+    let msg: ChatMessage
+
+    var body: some View {
+        switch msg.role {
+        case .user:
+            HStack(alignment: .top, spacing: 4) {
+                Spacer(minLength: 24)
+                Text(msg.text)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(DS.cyan)
+                    .frame(maxWidth: 230, alignment: .trailing)
+            }
+        case .assistant:
+            VStack(alignment: .leading, spacing: 5) {
+                if !msg.toolCalls.isEmpty {
+                    FlowLayout(spacing: 4) {
+                        ForEach(msg.toolCalls.indices, id: \.self) { i in
+                            Text(msg.toolCalls[i])
+                                .font(.system(size: 9, weight: .black, design: .monospaced))
+                                .foregroundColor(.black)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(DS.yellow.opacity(0.9))
+                        }
+                    }
+                }
+                if !msg.text.isEmpty {
+                    Text(msg.text)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.9))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        case .system:
+            Text(msg.text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(msg.isError ? .orange : .white.opacity(0.5))
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background(msg.isError ? Color.orange.opacity(0.12) : Color.clear)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - Stream pane (top-left)
+
+private struct StreamPane: View {
+    @ObservedObject var gimbal:  GimbalService
+    @ObservedObject var tracker: CameraTracker
+    @ObservedObject private var journal: JournalAnalyzer
+
+    init(gimbal: GimbalService, tracker: CameraTracker) {
+        self.gimbal  = gimbal
+        self.tracker = tracker
+        self.journal = tracker.journalAnalyzer
+    }
+
+    var body: some View {
+        ZStack {
+            // Feed
+            if tracker.isRunning {
+                CameraPreviewView(tracker: tracker)
+            } else {
+                Rectangle().fill(Color.black)
+                Text("CAMERA OFF")
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .tracking(3)
+                    .foregroundColor(.white.opacity(0.12))
+            }
+
+            // Subject bboxes
+            if !tracker.allSubjects.isEmpty {
+                SubjectsOverlayView(subjects: tracker.allSubjects,
+                                    isFollowing: tracker.isFollowing)
+            } else if let bbox = tracker.detectedBbox {
+                SubjectsOverlayView(
+                    subjects: [DetectedSubject(bbox: bbox, isSpeaking: false,
+                                               isTracked: true, speakerLabel: nil)],
+                    isFollowing: tracker.isFollowing
+                )
+            }
+
+            // Observation overlay pill — bottom of feed
+            if let beat = journal.latestBeat {
+                VStack {
+                    Spacer()
+                    ObservationOverlay(beat: beat)
+                        .padding(.horizontal, 10)
+                        .padding(.bottom, 10)
+                }
+            }
+
+            // Corner badges — top corners only, minimal
+            VStack {
+                HStack(alignment: .top) {
+                    // Top-left: gesture/lock badges
+                    VStack(alignment: .leading, spacing: 3) {
+                        if tracker.followLocked {
+                            badge("LOCKED", icon: "lock.fill", color: DS.yellow)
+                        }
+                        if tracker.palmGestureActive {
+                            badge("PALM", icon: "hand.raised.fill", color: DS.cyan)
+                        }
+                        if tracker.pointingGestureActive {
+                            badge("POINTING", icon: "hand.point.right.fill", color: DS.purple)
+                        }
+                    }
+                    Spacer()
+                    // Top-right: tracking state
+                    if tracker.isRunning {
+                        let tracked = tracker.detectedBbox != nil || !tracker.allSubjects.isEmpty
+                        badge(tracked ? "TRACKING" : "NO SUBJECT",
+                              dot: true,
+                              color: tracked ? DS.green : .orange)
+                    }
+                }
+                Spacer()
+            }
+            .padding(7)
+        }
+    }
+
+    @ViewBuilder
+    private func badge(_ text: String, icon: String? = nil, dot: Bool = false, color: Color) -> some View {
+        HStack(spacing: 3) {
+            if let icon { Image(systemName: icon).font(.system(size: 7)) }
+            if dot { Circle().fill(color).frame(width: 5, height: 5) }
+            Text(text).font(.system(size: 7, weight: .black, design: .monospaced))
+        }
+        .foregroundColor(dot ? color : .black)
+        .padding(.horizontal, 5).padding(.vertical, 2)
+        .background(dot ? Color.black.opacity(0.65) : color)
+        .overlay(dot ? Rectangle().stroke(color, lineWidth: 1) : nil)
+    }
+}
+
+// MARK: - Dynamic canvas (bottom-left)
+
+/// Contextually shows whatever is most useful right now:
+/// - Room sweep in progress  → live splat map
+/// - Panorama built           → panorama sphere
+/// - Sweep done, no panorama  → static splat map with tap-to-navigate
+/// - Camera running, no sweep → live scene labels from journal
+/// - Idle                     → dark placeholder
+
+private struct DynamicCanvas: View {
+    @ObservedObject var gimbal:   GimbalService
+    @ObservedObject var tracker:  CameraTracker
+    @ObservedObject private var panorama: PanoramaBuilder
+    @ObservedObject private var journal:  JournalAnalyzer
+
+    init(gimbal: GimbalService, tracker: CameraTracker) {
+        self.gimbal   = gimbal
+        self.tracker  = tracker
+        self.panorama = tracker.panoramaBuilder
+        self.journal  = tracker.journalAnalyzer
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            content
+            canvasLabel
+        }
+        .background(DS.surface2)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch canvasMode {
+        case .sweeping:
+            SplatMapView(
+                subjects: tracker.subjectMap,
+                currentYaw: gimbal.state.currentPosition.yaw,
+                currentPitch: gimbal.state.currentPosition.pitch,
+                sweepState: tracker.roomSweepState,
+                sweepCurrentYaw: tracker.sweepCurrentYaw,
+                sweepCurrentPitch: tracker.sweepCurrentPitch
+            )
+
+        case .panorama(let img):
+            PanoramaSphereView(
+                panorama: img,
+                subjects: tracker.subjectMap,
+                onTapSubject: { entry in
+                    tracker.navigateTo(yaw: entry.approximateYaw, pitch: entry.approximatePitch)
+                }
+            )
+            .overlay(
+                Text("DRAG · TAP DOT")
+                    .font(.system(size: 7, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.2))
+                    .padding(5),
+                alignment: .bottomLeading
+            )
+
+        case .building:
+            PanoramaBuildingView()
+
+        case .splatReady:
+            SplatMapView(
+                subjects: tracker.subjectMap,
+                currentYaw: gimbal.state.currentPosition.yaw,
+                currentPitch: gimbal.state.currentPosition.pitch,
+                sweepState: tracker.roomSweepState,
+                sweepCurrentYaw: tracker.sweepCurrentYaw,
+                sweepCurrentPitch: tracker.sweepCurrentPitch,
+                onTapSubject: { entry in
+                    tracker.navigateTo(yaw: entry.approximateYaw, pitch: entry.approximatePitch)
+                }
+            )
+            .overlay(
+                // People tags below the map
+                VStack(spacing: 0) {
+                    Spacer()
+                    ForEach(tracker.subjectMap.indices, id: \.self) { idx in
+                        PersonTagRow(
+                            entry: tracker.subjectMap[idx],
+                            onTap: {
+                                tracker.navigateTo(yaw: tracker.subjectMap[idx].approximateYaw,
+                                                   pitch: tracker.subjectMap[idx].approximatePitch)
+                            },
+                            onNameChange: { name in
+                                tracker.subjectMap[idx].name = name.isEmpty ? nil : name
+                            }
+                        )
+                        .padding(.horizontal, 8)
+                        .background(DS.surface2.opacity(0.9))
+                    }
+                }
+            )
+
+        case .sceneLabels:
+            sceneLabelsView
+
+        case .idle:
+            idleView
+        }
+    }
+
+    private enum CanvasMode {
+        case sweeping
+        case panorama(NSImage)
+        case building
+        case splatReady
+        case sceneLabels
+        case idle
+    }
+
+    private var canvasMode: CanvasMode {
+        if tracker.roomSweepState == .sweeping { return .sweeping }
+        if panorama.isBuilding                  { return .building }
+        if let img = panorama.panorama           { return .panorama(img) }
+        if tracker.roomSweepState == .ready      { return .splatReady }
+        if let obs = journal.latestObservation,
+           !obs.sceneLabels.isEmpty || !obs.subjects.isEmpty {
+            return .sceneLabels
+        }
+        return .idle
+    }
+
+    @ViewBuilder
+    private var sceneLabelsView: some View {
+        let obs = journal.latestObservation
+        VStack(alignment: .leading, spacing: 6) {
+            if let obs {
+                // People chips
+                if !obs.subjects.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "person.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(DS.cyan)
+                        Text("\(obs.subjects.count) in frame")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundColor(DS.cyan)
+                        if !obs.bodyActivities.isEmpty {
+                            Text("·")
+                                .foregroundColor(.white.opacity(0.2))
+                            Text(obs.bodyActivities.prefix(2).joined(separator: ", "))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.5))
+                        }
+                    }
+                }
+                // Scene label chips
+                let labels = obs.sceneLabels.prefix(8)
+                if !labels.isEmpty {
+                    FlowLayout(spacing: 4) {
+                        ForEach(labels.indices, id: \.self) { i in
+                            let item = labels[i]
+                            HStack(spacing: 3) {
+                                Text(item.label)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.65))
+                                Text(String(format: "%.0f%%", item.confidence * 100))
+                                    .font(.system(size: 7, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.3))
+                            }
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(DS.surface)
+                            .overlay(Rectangle().stroke(DS.divider, lineWidth: 1))
+                        }
+                    }
+                }
+                // Visible text
+                if !obs.visibleText.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "text.viewfinder")
+                            .font(.system(size: 9))
+                            .foregroundColor(.white.opacity(0.3))
+                        Text(obs.visibleText.prefix(3).joined(separator: "  ·  "))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.4))
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private var idleView: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "globe.desk")
+                .font(.system(size: 20))
+                .foregroundColor(.white.opacity(0.08))
+            Text("SCAN ROOM TO MAP")
+                .font(.system(size: 8, weight: .black, design: .monospaced))
+                .tracking(1)
+                .foregroundColor(.white.opacity(0.12))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var canvasLabel: some View {
+        HStack(spacing: 4) {
+            let (icon, label, color) = canvasLabelInfo
+            Image(systemName: icon).font(.system(size: 7)).foregroundColor(color)
+            Text(label)
+                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .foregroundColor(color)
+        }
+        .padding(.horizontal, 5).padding(.vertical, 3)
+        .background(Color.black.opacity(0.55))
+        .padding(5)
+    }
+
+    private var canvasLabelInfo: (String, String, Color) {
+        switch canvasMode {
+        case .sweeping:      return ("scope",          "SCANNING",  DS.green)
+        case .panorama:      return ("globe.americas", "PANORAMA",  DS.green)
+        case .building:      return ("gearshape",      "BUILDING",  DS.yellow)
+        case .splatReady:    return ("map",             "ROOM MAP",  DS.green)
+        case .sceneLabels:   return ("sparkles",        "SCENE",     DS.yellow)
+        case .idle:          return ("globe.desk",      "CANVAS",    Color.white.opacity(0.2))
+        }
+    }
+}
+
+// MARK: - Simple flow layout for chips
+
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxW = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowH: CGFloat = 0
+        for sub in subviews {
+            let s = sub.sizeThatFits(.unspecified)
+            if x + s.width > maxW && x > 0 { x = 0; y += rowH + spacing; rowH = 0 }
+            x += s.width + spacing
+            rowH = max(rowH, s.height)
+        }
+        return CGSize(width: maxW, height: y + rowH)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxW = bounds.width
+        var x = bounds.minX, y = bounds.minY, rowH: CGFloat = 0
+        for sub in subviews {
+            let s = sub.sizeThatFits(.unspecified)
+            if x + s.width > bounds.minX + maxW && x > bounds.minX {
+                x = bounds.minX; y += rowH + spacing; rowH = 0
+            }
+            sub.place(at: CGPoint(x: x, y: y), proposal: .unspecified)
+            x += s.width + spacing
+            rowH = max(rowH, s.height)
+        }
+    }
+}
+
+// MARK: - Status bar (top-right)
+
+private struct StatusBar: View {
+    @ObservedObject var gimbal:       GimbalService
+    @ObservedObject var tracker:      CameraTracker
+    @ObservedObject private var speaker:     SpeakerFollowManager
+    @ObservedObject private var transcriber: WhisperTranscriber
+    @State private var showSettings = false
+
+    init(gimbal: GimbalService, tracker: CameraTracker) {
+        self.gimbal      = gimbal
+        self.tracker     = tracker
+        self.speaker     = tracker.speakerManager
+        self.transcriber = tracker.transcriber
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Camera live indicator
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(tracker.isRunning ? DS.green : Color.white.opacity(0.15))
+                    .frame(width: 7, height: 7)
+                Text(tracker.isRunning ? "LIVE" : "OFF")
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .tracking(1)
+                    .foregroundColor(tracker.isRunning ? DS.green : .white.opacity(0.3))
+            }
+
+            // SIM badge — visible only when simulator is on
+            if gimbal.isSimulator {
+                Text("SIM")
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(DS.purple)
+            }
+
+            // Subject count
+            if tracker.isRunning {
+                let n = tracker.allSubjects.isEmpty
+                    ? (tracker.detectedBbox != nil ? 1 : 0)
+                    : tracker.allSubjects.count
+                if n > 0 {
+                    Text("\(n)P")
+                        .font(.system(size: 12, weight: .black, design: .monospaced))
+                        .foregroundColor(DS.cyan)
+                }
+            }
+
+            Spacer()
+
+            // Gimbal position readout — proves the sim/real motor is actually moving
+            if gimbal.state.connectionState.isConnected {
+                let p = gimbal.state.currentPosition
+                HStack(spacing: 0) {
+                    Text(String(format: "%+.0f°", p.yaw))
+                        .font(.system(size: 11, design: .monospaced).monospacedDigit())
+                        .foregroundColor(DS.yellow.opacity(0.85))
+                    Text(",")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.3))
+                    Text(String(format: "%+.0f°", p.pitch))
+                        .font(.system(size: 11, design: .monospaced).monospacedDigit())
+                        .foregroundColor(DS.yellow.opacity(0.85))
+                }
+                .help("Gimbal yaw, pitch")
+            }
+
+            // FPS readout
+            if tracker.isRunning {
+                HStack(spacing: 2) {
+                    Text("\(tracker.fps)")
+                        .font(.system(size: 12, design: .monospaced).monospacedDigit())
+                        .foregroundColor(DS.green.opacity(0.85))
+                    Text("fps")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.3))
+                }
+            }
+
+            // Mic / speech indicator
+            Image(systemName: speaker.isSpeechDetected ? "mic.fill" : "mic")
+                .font(.system(size: 14))
+                .foregroundColor(speaker.isSpeechDetected ? DS.green : Color.white.opacity(0.3))
+                .frame(width: 22, height: 22)
+                .help(transcriber.isTranscribing ? "Listening" : "Mic idle")
+
+            // Simulator toggle (icon button)
+            Button { gimbal.toggleSimulator() } label: {
+                Image(systemName: gimbal.isSimulator ? "die.face.5.fill" : "die.face.5")
+                    .font(.system(size: 14))
+                    .foregroundColor(gimbal.isSimulator ? DS.purple : .white.opacity(0.4))
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(gimbal.isSimulator ? "Disable simulator (use real BLE)" : "Enable gimbal simulator")
+
+            // Settings popover
+            Button { showSettings.toggle() } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(showSettings ? DS.yellow : .white.opacity(0.4))
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showSettings, arrowEdge: .trailing) {
+                SettingsPopover(tracker: tracker, gimbal: gimbal)
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(maxHeight: .infinity)
+        .background(DS.surface2)
+    }
+}
+
+// MARK: - Settings popover
+
+private struct SettingsPopover: View {
+    @ObservedObject var tracker:    CameraTracker
+    @ObservedObject var gimbal:     GimbalService
+    @ObservedObject private var speaker:     SpeakerFollowManager
+    @ObservedObject private var transcriber: WhisperTranscriber
+
+    init(tracker: CameraTracker, gimbal: GimbalService) {
+        self.tracker     = tracker
+        self.gimbal      = gimbal
+        self.speaker     = tracker.speakerManager
+        self.transcriber = tracker.transcriber
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+
+            // ── Camera selection ──────────────────────────────────
+            VStack(alignment: .leading, spacing: 6) {
                 Text("CAMERA")
                     .font(.system(size: 10, weight: .black, design: .monospaced))
                     .tracking(2)
-                    .foregroundColor(Color(hex: "FFE500"))
-
-                Spacer()
-
-                // Camera picker inline
+                    .foregroundColor(.white.opacity(0.45))
                 Picker("", selection: $tracker.selectedCamera) {
                     ForEach(tracker.availableCameras, id: \.uniqueID) { cam in
                         Text(cam.localizedName).tag(cam as AVCaptureDevice?)
@@ -136,781 +1506,344 @@ private struct CameraStripSection: View {
                 }
                 .pickerStyle(.menu)
                 .disabled(tracker.isRunning)
-                .font(.system(size: 10, design: .monospaced))
-
-                // Tracking type picker
-                Picker("", selection: $tracker.trackingType) {
-                    Text("FACE").tag(TrackingType.face)
-                    Text("BODY").tag(TrackingType.person)
-                }
-                .pickerStyle(.segmented)
-                .disabled(tracker.isRunning)
-                .frame(maxWidth: 110)
-
-                // Settings gear
-                Button {
-                    showSettings.toggle()
-                } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(showSettings ? Color(hex: "FFE500") : .white.opacity(0.5))
-                }
-                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(hex: "111111"))
 
-            // Camera preview
-            ZStack {
-                CameraPreviewView(tracker: tracker)
-                    .frame(height: 280)
-
-                if !tracker.allSubjects.isEmpty {
-                    SubjectsOverlayView(subjects: tracker.allSubjects,
-                                        isFollowing: tracker.isFollowing,
-                                        height: 280)
-                } else if let bbox = tracker.detectedBbox {
-                    SubjectsOverlayView(
-                        subjects: [DetectedSubject(bbox: bbox, isSpeaking: false,
-                                                   isTracked: true, speakerLabel: nil)],
-                        isFollowing: tracker.isFollowing,
-                        height: 280
-                    )
-                }
-
-                if !tracker.isRunning {
-                    Rectangle()
-                        .fill(Color.black.opacity(0.75))
-                        .frame(height: 280)
-                        .overlay(
-                            Text("CAMERA OFF")
-                                .font(.system(size: 12, weight: .black, design: .monospaced))
-                                .tracking(3)
-                                .foregroundColor(.white.opacity(0.4))
-                        )
-                }
-
-                // FPS badge — top right
-                if tracker.isRunning {
-                    VStack {
-                        HStack {
-                            Spacer()
-                            Text("\(tracker.fps) FPS")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundColor(Color(hex: "39FF14"))
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.black.opacity(0.7))
-                                .overlay(Rectangle().stroke(Color(hex: "39FF14"), lineWidth: 1))
-                                .padding(6)
-                        }
-                        Spacer()
-                    }
-                }
-
-                // Palm gesture badge
-                if tracker.palmGestureActive {
-                    VStack {
-                        Spacer()
-                        HStack {
-                            HStack(spacing: 4) {
-                                Image(systemName: "hand.raised.fill")
-                                    .font(.system(size: 9))
-                                Text("PALM")
-                                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                            }
-                            .foregroundColor(.black)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(Color(hex: "00FFFF"))
-                            .padding(6)
-                            Spacer()
-                        }
-                    }
-                }
-
-                // Tracking status — bottom right
-                if tracker.isRunning {
-                    VStack {
-                        Spacer()
-                        HStack {
-                            Spacer()
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(tracker.detectedBbox != nil ? Color(hex: "39FF14") : Color.orange)
-                                    .frame(width: 5, height: 5)
-                                Text(tracker.detectedBbox != nil ? "TRACKING" : "NO SUBJECT")
-                                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                                    .foregroundColor(tracker.detectedBbox != nil ? Color(hex: "39FF14") : .orange)
-                            }
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Color.black.opacity(0.7))
-                            .padding(6)
-                        }
-                    }
-                }
-            }
-            .frame(height: 280)
-
-            // Bottom action bar
-            HStack(spacing: 8) {
-                Button(tracker.isRunning ? "STOP CAM" : "START CAM") {
-                    if tracker.isRunning { tracker.stopCamera() } else { tracker.startCamera() }
-                }
-                .font(.system(size: 10, weight: .black, design: .monospaced))
-                .tracking(1)
-                .foregroundColor(tracker.isRunning ? .black : Color(hex: "0A0A0A"))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(tracker.isRunning ? Color.orange : Color(hex: "FFE500"))
-
-                Spacer()
-
-                // Follow toggle
-                HStack(spacing: 6) {
-                    Text("FOLLOW")
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
-                        .tracking(1)
-                        .foregroundColor(tracker.isFollowing ? Color(hex: "00FFFF") : .white.opacity(0.4))
-
-                    Toggle("", isOn: Binding(
-                        get: { tracker.isFollowing },
-                        set: { on in
-                            if on && gimbal.state.connectionState.isConnected {
-                                tracker.startFollow()
-                            } else {
-                                tracker.stopFollow()
-                            }
-                        }
-                    ))
-                    .labelsHidden()
-                    .disabled(!tracker.isRunning || !gimbal.state.connectionState.isConnected
-                              || tracker.roomSweepState == .sweeping)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(hex: "111111"))
-        }
-        .brutalCard(Color(hex: "FFE500"), lineWidth: 2)
-    }
-}
-
-// MARK: - Room Card
-
-private struct RoomCardSection: View {
-    @ObservedObject var gimbal: GimbalService
-    @ObservedObject var tracker: CameraTracker
-    @ObservedObject private var panorama: PanoramaBuilder
-
-    init(gimbal: GimbalService, tracker: CameraTracker) {
-        self.gimbal = gimbal
-        self.tracker = tracker
-        self.panorama = tracker.panoramaBuilder
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Text("ROOM")
-                    .font(.system(size: 10, weight: .black, design: .monospaced))
-                    .tracking(2)
-                    .foregroundColor(Color(hex: "39FF14"))
-                Spacer()
-
-                if tracker.isNavigating {
-                    HStack(spacing: 4) {
-                        ProgressView().scaleEffect(0.55)
-                            .tint(Color(hex: "39FF14"))
-                        Text("NAV")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(Color(hex: "39FF14"))
-                    }
-                } else if tracker.roomSweepState == .sweeping {
-                    HStack(spacing: 4) {
-                        ProgressView().scaleEffect(0.55)
-                            .tint(Color(hex: "39FF14"))
-                        Text("SCANNING")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(Color(hex: "39FF14"))
-                    }
-                } else if panorama.isBuilding {
-                    HStack(spacing: 4) {
-                        ProgressView().scaleEffect(0.55)
-                            .tint(Color(hex: "39FF14"))
-                        Text("BUILDING")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(Color(hex: "39FF14"))
-                    }
-                } else {
-                    Button(tracker.roomSweepState == .ready ? "RE-SCAN" : "SCAN") {
-                        tracker.scanRoom()
-                    }
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Color(hex: "39FF14"))
-                    .disabled(!tracker.isRunning || !gimbal.state.connectionState.isConnected)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(hex: "0D0D0D"))
-
-            // Content
+            // ── Live transcription ───────────────────────────────
             VStack(alignment: .leading, spacing: 6) {
-                if tracker.roomSweepState == .sweeping {
-                    SplatMapView(
-                        subjects: tracker.subjectMap,
-                        currentYaw: gimbal.state.currentPosition.yaw,
-                        currentPitch: gimbal.state.currentPosition.pitch,
-                        sweepState: tracker.roomSweepState,
-                        sweepCurrentYaw: tracker.sweepCurrentYaw,
-                        sweepCurrentPitch: tracker.sweepCurrentPitch
-                    )
-                    Text("SCANNING ROOM…")
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.3))
-                        .padding(.horizontal, 4)
-                }
-
-                if tracker.roomSweepState == .ready {
-                    if let pano = panorama.panorama {
-                        PanoramaSphereView(
-                            panorama: pano,
-                            subjects: tracker.subjectMap,
-                            onTapSubject: { entry in
-                                tracker.navigateTo(
-                                    yaw: entry.approximateYaw,
-                                    pitch: entry.approximatePitch)
-                            }
-                        )
-                        .frame(height: 200)
-                        .overlay(Rectangle().stroke(Color(hex: "39FF14").opacity(0.3), lineWidth: 1))
-
-                        Text("DRAG TO LOOK  •  TAP DOT TO GO")
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.25))
-                            .padding(.horizontal, 4)
-                    } else if panorama.isBuilding {
-                        PanoramaBuildingView()
-                            .frame(height: 100)
-                    } else {
-                        SplatMapView(
-                            subjects: tracker.subjectMap,
-                            currentYaw: gimbal.state.currentPosition.yaw,
-                            currentPitch: gimbal.state.currentPosition.pitch,
-                            sweepState: tracker.roomSweepState,
-                            sweepCurrentYaw: tracker.sweepCurrentYaw,
-                            sweepCurrentPitch: tracker.sweepCurrentPitch,
-                            onTapSubject: { entry in
-                                tracker.navigateTo(
-                                    yaw: entry.approximateYaw,
-                                    pitch: entry.approximatePitch)
-                            }
-                        )
-                    }
-
-                    // Person count + list
-                    if tracker.subjectMap.isEmpty {
-                        Text("NO PEOPLE DETECTED")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.25))
-                            .padding(.horizontal, 4)
-                    } else {
-                        HStack {
-                            Text("\(tracker.subjectMap.count) PERSON\(tracker.subjectMap.count == 1 ? "" : "S")")
-                                .font(.system(size: 9, weight: .black, design: .monospaced))
-                                .foregroundColor(Color(hex: "39FF14"))
-                        }
-                        .padding(.horizontal, 4)
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(tracker.subjectMap.indices, id: \.self) { idx in
-                                PersonTagRow(
-                                    entry: tracker.subjectMap[idx],
-                                    onTap: {
-                                        tracker.navigateTo(
-                                            yaw: tracker.subjectMap[idx].approximateYaw,
-                                            pitch: tracker.subjectMap[idx].approximatePitch)
-                                    },
-                                    onNameChange: { newName in
-                                        tracker.subjectMap[idx].name = newName.isEmpty ? nil : newName
-                                    }
-                                )
-                            }
-                        }
-                        .padding(.horizontal, 4)
-                    }
-                }
-
-                if tracker.roomSweepState == .idle {
-                    Spacer()
-                    Text("PRESS SCAN TO MAP\nTHE ROOM")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.2))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity)
-                    Spacer()
-                }
-            }
-            .padding(8)
-        }
-    }
-}
-
-// MARK: - Follow Card
-
-private struct FollowCardSection: View {
-    @ObservedObject var tracker: CameraTracker
-    @ObservedObject private var speaker: SpeakerFollowManager
-    @ObservedObject private var transcriber: WhisperTranscriber
-
-    init(tracker: CameraTracker) {
-        self.tracker = tracker
-        self.speaker = tracker.speakerManager
-        self.transcriber = tracker.transcriber
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Text("FOLLOW")
+                Text("LIVE TRANSCRIPTION")
                     .font(.system(size: 10, weight: .black, design: .monospaced))
                     .tracking(2)
-                    .foregroundColor(Color(hex: "00FFFF"))
-                Spacer()
-                Toggle("", isOn: $tracker.speakerFollowEnabled)
-                    .labelsHidden()
+                    .foregroundColor(.white.opacity(0.45))
+                if transcriber.isModelLoaded {
+                    Toggle(isOn: Binding(
+                        get: { transcriber.isTranscribing },
+                        set: { on in if on { transcriber.start() } else { transcriber.stop() } }
+                    )) {
+                        Text(transcriber.isTranscribing ? "Listening" : "Off")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
+                    .toggleStyle(.switch)
                     .disabled(!tracker.isRunning)
-                    .tint(Color(hex: "00FFFF"))
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(hex: "0D0D0D"))
-
-            VStack(alignment: .leading, spacing: 8) {
-                if tracker.speakerFollowEnabled {
-                    // Audio level bar
-                    HStack(spacing: 6) {
-                        Image(systemName: speaker.isSpeechDetected ? "mic.fill" : "mic")
-                            .foregroundColor(speaker.isSpeechDetected ? Color(hex: "39FF14") : .white.opacity(0.3))
-                            .font(.system(size: 10))
-                            .frame(width: 12)
-                        AudioLevelBar(level: speaker.audioLevel, isActive: speaker.isSpeechDetected)
-                    }
-
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(speaker.isSpeechDetected ? Color(hex: "39FF14") : .white.opacity(0.2))
-                            .frame(width: 5, height: 5)
-                        Text(speaker.isSpeechDetected ? "SPEAKING" : "SILENCE")
-                            .font(.system(size: 9, weight: .black, design: .monospaced))
-                            .foregroundColor(speaker.isSpeechDetected ? Color(hex: "39FF14") : .white.opacity(0.3))
-                    }
-
-                    // Room sweep status
-                    switch tracker.roomSweepState {
-                    case .sweeping:
-                        HStack(spacing: 4) {
-                            ProgressView().scaleEffect(0.55).tint(Color(hex: "00FFFF"))
-                            Text("SCANNING…")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundColor(Color(hex: "00FFFF"))
-                        }
-                    case .ready:
-                        if !tracker.subjectMap.isEmpty {
-                            VStack(alignment: .leading, spacing: 2) {
-                                ForEach(tracker.subjectMap) { entry in
-                                    HStack(spacing: 4) {
-                                        Rectangle()
-                                            .fill(Color(hex: "00FFFF"))
-                                            .frame(width: 4, height: 4)
-                                        Text("SPK \(entry.speakerNumber)  \(String(format: "%.0f°", entry.approximateYaw))")
-                                            .font(.system(size: 9, design: .monospaced))
-                                            .foregroundColor(.white.opacity(0.6))
-                                    }
-                                }
-                            }
-                        }
-                    case .idle:
-                        EmptyView()
-                    }
-
-                    // Divider
-                    Rectangle()
-                        .fill(Color(hex: "00FFFF").opacity(0.2))
-                        .frame(height: 1)
-
-                    // Live captions header
+                    .tint(DS.cyan)
+                } else {
                     HStack {
-                        Text("CAPTIONS")
-                            .font(.system(size: 9, weight: .black, design: .monospaced))
-                            .tracking(1)
-                            .foregroundColor(Color(hex: "00FFFF").opacity(0.7))
+                        Text(transcriber.loadingStatus)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.55))
+                            .lineLimit(1)
                         Spacer()
-                        if !transcriber.isModelLoaded {
-                            if transcriber.loadingStatus == "Not loaded" {
-                                Button("LOAD") { transcriber.loadModel() }
-                                    .font(.system(size: 8, weight: .black, design: .monospaced))
-                                    .foregroundColor(.black)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 2)
-                                    .background(Color(hex: "00FFFF"))
-                            } else {
-                                Text(transcriber.loadingStatus)
-                                    .font(.system(size: 8, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.4))
-                            }
-                        } else {
-                            Toggle("", isOn: Binding(
-                                get: { transcriber.isTranscribing },
-                                set: { on in if on { transcriber.start() } else { transcriber.stop() } }
-                            ))
-                            .labelsHidden()
-                            .disabled(!tracker.isRunning)
-                            .tint(Color(hex: "00FFFF"))
-                        }
+                        Button("LOAD MODEL") { transcriber.loadModel() }
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(DS.cyan)
+                            .buttonStyle(.plain)
                     }
-
-                    // Last 2 lines of transcript
-                    if transcriber.isTranscribing || !transcriber.transcript.isEmpty {
-                        let lines = transcriber.transcript.isEmpty
-                            ? ["LISTENING…"]
-                            : transcriber.transcript.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(2).map { String($0) }
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                                Text(line)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(transcriber.transcript.isEmpty
-                                                     ? .white.opacity(0.25)
-                                                     : .white.opacity(0.8))
-                                    .lineLimit(1)
-                                    .truncationMode(.head)
-                            }
-                        }
-                        .padding(6)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(hex: "00FFFF").opacity(0.05))
-                        .overlay(Rectangle().stroke(Color(hex: "00FFFF").opacity(0.2), lineWidth: 1))
-                    }
-
-                } else {
-                    Spacer()
-                    Text("TOGGLE TO\nENABLE FOLLOW")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.2))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity)
-                    Spacer()
                 }
             }
-            .padding(8)
-        }
-    }
-}
 
-// MARK: - Observe Strip
+            Divider().background(DS.divider)
 
-private struct ObserveStrip: View {
-    @ObservedObject var tracker: CameraTracker
-    @ObservedObject private var journal: JournalAnalyzer
-
-    init(tracker: CameraTracker) {
-        self.tracker = tracker
-        self.journal = tracker.journalAnalyzer
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("OBSERVE")
+            // ── Follow tuning ────────────────────────────────────
+            VStack(alignment: .leading, spacing: 8) {
+                Text("FOLLOW TUNING")
                     .font(.system(size: 10, weight: .black, design: .monospaced))
                     .tracking(2)
-                    .foregroundColor(Color(hex: "FFE500"))
-
-                Spacer()
-
-                if journal.isWriting {
-                    HStack(spacing: 4) {
-                        ProgressView().scaleEffect(0.5).tint(Color(hex: "FFE500"))
-                        Text("MLX WRITING")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(Color(hex: "FFE500").opacity(0.7))
-                    }
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color(hex: "0D0D0D"))
-
-            HStack(spacing: 8) {
-                if journal.isAnalyzing, let obs = journal.latestObservation {
-                    Text(obs.oneLiner)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.85))
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .animation(.easeInOut(duration: 0.4), value: obs.timestamp)
-                } else {
-                    Text("JOURNAL NOT ACTIVE")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.2))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 7)
-        }
-        .brutalCard(Color(hex: "FFE500").opacity(0.5), lineWidth: 1)
-    }
-}
-
-// MARK: - Narrative Panel
-
-private struct NarrativePanel: View {
-    @ObservedObject var tracker: CameraTracker
-    @ObservedObject private var journal: JournalAnalyzer
-    @ObservedObject private var runner: MLXRunner
-
-    init(tracker: CameraTracker) {
-        self.tracker = tracker
-        self.journal = tracker.journalAnalyzer
-        self.runner = tracker.journalAnalyzer.runner
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Header bar
-            HStack {
-                Text("JOURNAL")
-                    .font(.system(size: 10, weight: .black, design: .monospaced))
-                    .tracking(2)
-                    .foregroundColor(Color(hex: "FFE500"))
-
-                Spacer()
-
-                if journal.isAnalyzing {
-                    Button("STOP") { journal.stop() }
-                        .font(.system(size: 9, weight: .black, design: .monospaced))
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.orange)
-                } else {
-                    Button("START") {
-                        journal.start(tracker: tracker, transcriber: tracker.transcriber)
-                    }
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Color(hex: "FFE500"))
-                    .disabled(!tracker.isRunning || !runner.isReady)
-                    .opacity(!tracker.isRunning || !runner.isReady ? 0.4 : 1.0)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color(hex: "0D0D0D"))
-
-            // MLX status
-            HStack(spacing: 0) {
-                MLXStatusRow(runner: runner, journal: journal)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(hex: "050505"))
-
-            // Config row (when stopped + idle)
-            if !journal.isAnalyzing, case .idle = runner.state {
-                HStack(spacing: 8) {
-                    Text("MODEL")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.4))
-                        .frame(width: 44, alignment: .leading)
-                    TextField("mlx-community/Qwen2.5-1.5B-Instruct-4bit",
-                              text: $runner.modelTag)
-                        .font(.system(size: 9, design: .monospaced))
-                        .textFieldStyle(.roundedBorder)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(Color(hex: "050505"))
-            }
-
-            // Narrative text
-            ScrollView {
-                if journal.narrative.isEmpty {
-                    Text("Waiting for first scene change…")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(0.2))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                } else {
-                    Text(journal.narrative)
-                        .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(0.85))
-                        .lineSpacing(4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .animation(.easeIn(duration: 0.3), value: journal.beats.count)
-                }
-            }
-            .frame(height: 110)
-        }
-        .brutalCard(Color(hex: "FFE500"), lineWidth: 2)
-    }
-}
-
-// MARK: - Capture Row
-
-private struct CaptureRow: View {
-    @ObservedObject var tracker: CameraTracker
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text("CAPTURE")
-                .font(.system(size: 10, weight: .black, design: .monospaced))
-                .tracking(2)
-                .foregroundColor(.white.opacity(0.5))
-
-            Button {
-                tracker.capturePhoto()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "camera.fill").font(.system(size: 9))
-                    Text("PHOTO").font(.system(size: 9, weight: .black, design: .monospaced))
-                }
-                .foregroundColor(.black)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.white)
-            }
-            .buttonStyle(.plain)
-            .disabled(!tracker.isRunning)
-            .opacity(!tracker.isRunning ? 0.3 : 1.0)
-
-            Button {
-                if tracker.isRecording { tracker.stopRecording() }
-                else { tracker.startRecording() }
-            } label: {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(tracker.isRecording ? Color.red : Color.white)
-                        .frame(width: 7, height: 7)
-                    if tracker.isRecording {
-                        Text(recordingLabel)
-                            .font(.system(size: 9, weight: .black, design: .monospaced))
-                            .foregroundColor(.black)
-                            .monospacedDigit()
-                    } else {
-                        Text("REC").font(.system(size: 9, weight: .black, design: .monospaced))
-                            .foregroundColor(.black)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(tracker.isRecording ? Color.red : Color.white)
-            }
-            .buttonStyle(.plain)
-            .disabled(!tracker.isRunning)
-            .opacity(!tracker.isRunning ? 0.3 : 1.0)
-
-            Spacer()
-
-            if tracker.lastPhotoURL != nil || tracker.lastVideoURL != nil {
-                Menu {
-                    if let url = tracker.lastPhotoURL {
-                        Button("Show Last Photo") {
-                            NSWorkspace.shared.activateFileViewerSelecting([url])
-                        }
-                    }
-                    if let url = tracker.lastVideoURL {
-                        Button("Show Last Video") {
-                            NSWorkspace.shared.activateFileViewerSelecting([url])
-                        }
-                    }
-                    Button("Open Captures Folder") {
-                        NSWorkspace.shared.open(gimbalCapturesDir)
-                    }
-                } label: {
-                    Image(systemName: "folder")
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.5))
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 24)
-            }
-
-            if let url = tracker.lastPhotoURL ?? tracker.lastVideoURL {
-                Text(url.lastPathComponent)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.3))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 120)
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .brutalCard(Color.white.opacity(0.15), lineWidth: 1)
-    }
-
-    private var recordingLabel: String {
-        let total = Int(tracker.recordingDuration)
-        let m = total / 60
-        let s = total % 60
-        return String(format: "%d:%02d", m, s)
-    }
-}
-
-// MARK: - Settings Panel (collapsible)
-
-private struct SettingsPanel: View {
-    @ObservedObject var tracker: CameraTracker
-    @ObservedObject var gimbal: GimbalService
-    @ObservedObject private var speaker: SpeakerFollowManager
-
-    init(tracker: CameraTracker, gimbal: GimbalService) {
-        self.tracker = tracker
-        self.gimbal = gimbal
-        self.speaker = tracker.speakerManager
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("SETTINGS")
-                .font(.system(size: 10, weight: .black, design: .monospaced))
-                .tracking(2)
-                .foregroundColor(.white.opacity(0.5))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(Color(hex: "0D0D0D"))
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            VStack(spacing: 6) {
-                LabeledSlider(label: "GAIN", value: $tracker.gain, range: 0...1)
+                    .foregroundColor(.white.opacity(0.45))
+                LabeledSlider(label: "GAIN",     value: $tracker.gain,    range: 0...1)
                     .disabled(!tracker.isFollowing)
                 LabeledSlider(label: "DEADZONE", value: $tracker.deadZone, range: 0...0.2, format: "%.3f")
                     .disabled(!tracker.isFollowing)
                 LabeledSliderFloat(label: "MIC SENS", value: $speaker.threshold, range: 0.005...0.06, format: "%.3f")
-                    .disabled(!tracker.speakerFollowEnabled)
             }
-            .padding(8)
+
+            Divider().background(DS.divider)
+
+            // ── Timelapse ────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 8) {
+                Text("TIMELAPSE")
+                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .tracking(2)
+                    .foregroundColor(.white.opacity(0.45))
+                LabeledSlider(label: "INTERVAL", value: $tracker.timelapseInterval, range: 0.5...30, format: "%.1fs")
+                    .disabled(tracker.isTimelapsing)
+                Text("Output: 24fps. At interval=\(String(format: "%.1f", tracker.timelapseInterval))s, 1 hour real = \(String(format: "%.0f", 3600.0 / tracker.timelapseInterval / 24.0))s playback.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.45))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider().background(DS.divider)
+
+            // ── Simulator ────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 6) {
+                Text("GIMBAL SOURCE")
+                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .tracking(2)
+                    .foregroundColor(.white.opacity(0.45))
+                Toggle(isOn: Binding(
+                    get: { gimbal.isSimulator },
+                    set: { on in if on { gimbal.enableSimulator() } else { gimbal.disableSimulator() } }
+                )) {
+                    HStack(spacing: 6) {
+                        Image(systemName: gimbal.isSimulator ? "die.face.5.fill" : "die.face.5")
+                            .font(.system(size: 13))
+                            .foregroundColor(gimbal.isSimulator ? DS.purple : .white.opacity(0.6))
+                        Text(gimbal.isSimulator ? "Simulator (no hardware)" : "Real BLE gimbal")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
+                }
+                .toggleStyle(.switch)
+                .tint(DS.purple)
+            }
         }
-        .brutalCard(Color.white.opacity(0.2), lineWidth: 1)
+        .padding(16)
+        .frame(width: 320)
+        .background(DS.surface)
     }
 }
 
-// MARK: - Helpers reused from original
+// MARK: - Insight card (right panel, fills available height)
+
+private struct InsightCard: View {
+    @ObservedObject var tracker: CameraTracker
+    @ObservedObject private var journal: JournalAnalyzer
+    @ObservedObject private var runner:  MLXRunner
+
+    init(tracker: CameraTracker) {
+        self.tracker = tracker
+        self.journal = tracker.journalAnalyzer
+        self.runner  = tracker.journalAnalyzer.runner
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // ── Header ──────────────────────────────────────────────
+            HStack(spacing: 5) {
+                if journal.isWriting {
+                    ProgressView().scaleEffect(0.45).tint(DS.yellow)
+                } else {
+                    Circle()
+                        .fill(journal.isAnalyzing ? DS.yellow : Color.white.opacity(0.15))
+                        .frame(width: 5, height: 5)
+                }
+                Text("INSIGHT")
+                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .tracking(2)
+                    .foregroundColor(journal.isAnalyzing ? DS.yellow : Color.white.opacity(0.3))
+
+                Spacer()
+
+                // Mode rotation indicator
+                if journal.isAnalyzing {
+                    HStack(spacing: 3) {
+                        ForEach(ObservationMode.allCases, id: \.self) { m in
+                            let isLatest = journal.latestBeat?.mode == m
+                            Text(String(m.rawValue.prefix(3)))
+                                .font(.system(size: 9, weight: .black, design: .monospaced))
+                                .foregroundColor(isLatest ? .black : DS.modeColor(m).opacity(0.55))
+                                .padding(.horizontal, 5).padding(.vertical, 3)
+                                .background(isLatest ? DS.modeColor(m) : DS.modeColor(m).opacity(0.12))
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(DS.surface2)
+
+            // ── Main observation ─────────────────────────────────────
+            if let beat = journal.latestBeat {
+                let accent = DS.modeColor(beat.mode)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Rectangle().fill(accent).frame(width: 3, height: 16)
+                        Text(beat.mode.rawValue)
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .tracking(1)
+                            .foregroundColor(accent)
+                        Spacer()
+                        Text(timeAgo(beat.timestamp))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.3))
+                    }
+                    Text(beat.sentence)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.white.opacity(0.95))
+                        .lineSpacing(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .animation(.easeInOut(duration: 0.4), value: beat.id)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(DS.bg)
+            } else if journal.isAnalyzing {
+                HStack {
+                    ProgressView().scaleEffect(0.5).tint(DS.yellow)
+                    Text("Watching…")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.2))
+                    Spacer()
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(DS.bg)
+            } else {
+                // Not running — show MLX state
+                VStack(alignment: .leading, spacing: 8) {
+                    MLXStatusRow(runner: runner, journal: journal, tracker: tracker)
+                    Spacer()
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(DS.bg)
+            }
+
+            // ── History strip (last 3 beats) ─────────────────────────
+            if journal.beats.count > 1 {
+                VStack(alignment: .leading, spacing: 0) {
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(journal.beats.dropLast().suffix(3).reversed()) { beat in
+                        HStack(alignment: .firstTextBaseline, spacing: 7) {
+                            Text(String(beat.mode.rawValue.prefix(3)))
+                                .font(.system(size: 9, weight: .black, design: .monospaced))
+                                .foregroundColor(DS.modeColor(beat.mode).opacity(0.65))
+                                .frame(width: 32, alignment: .leading)
+                            Text(beat.sentence)
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.4))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .overlay(Rectangle().fill(DS.divider.opacity(0.5)).frame(height: 1), alignment: .bottom)
+                    }
+                }
+            }
+        }
+    }
+
+    private func timeAgo(_ date: Date) -> String {
+        let s = Int(Date().timeIntervalSince(date))
+        if s < 60   { return "\(s)s" }
+        if s < 3600 { return "\(s/60)m" }
+        return "\(s/3600)h"
+    }
+}
+
+// MARK: - Observation overlay (on video feed)
+
+private struct ObservationOverlay: View {
+    let beat: NarrativeBeat
+
+    var body: some View {
+        let accent = DS.modeColor(beat.mode)
+        HStack(alignment: .top, spacing: 6) {
+            Text(String(beat.mode.rawValue.prefix(3)))
+                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .foregroundColor(.black)
+                .padding(.horizontal, 4).padding(.vertical, 2)
+                .background(accent)
+
+            Text(beat.sentence)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.70))
+        .overlay(Rectangle().stroke(accent.opacity(0.3), lineWidth: 1))
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+        .animation(.easeInOut(duration: 0.5), value: beat.id)
+    }
+}
+
+// MARK: - MLX status row
+
+private struct MLXStatusRow: View {
+    @ObservedObject var runner:  MLXRunner
+    @ObservedObject var journal: JournalAnalyzer
+    var tracker: CameraTracker
+
+    var body: some View {
+        switch runner.state {
+        case .idle:
+            Button { runner.start() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu").font(.system(size: 9))
+                    Text("LOAD MODEL")
+                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                }
+                .foregroundColor(.black)
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background(DS.yellow)
+            }
+            .buttonStyle(.plain)
+
+        case .loading(let name):
+            HStack(spacing: 5) {
+                ProgressView().scaleEffect(0.5).tint(DS.yellow)
+                Text("LOADING \(name.uppercased())…")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(DS.yellow.opacity(0.7))
+                    .lineLimit(2)
+            }
+
+        case .ready:
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 5) {
+                    Rectangle().fill(DS.green).frame(width: 5, height: 5)
+                    Text("MODEL READY")
+                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                        .foregroundColor(DS.green.opacity(0.8))
+                }
+                Button("ANALYZE NOW") {
+                    journal.start(tracker: tracker, transcriber: tracker.transcriber)
+                }
+                .font(.system(size: 9, weight: .black, design: .monospaced))
+                .foregroundColor(.black)
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background(tracker.isRunning ? DS.yellow : DS.yellow.opacity(0.3))
+                .buttonStyle(.plain)
+                .disabled(!tracker.isRunning)
+            }
+
+        case .error(let msg):
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundColor(.orange).font(.system(size: 9))
+                    Text(msg)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.orange)
+                        .lineLimit(3)
+                }
+                if msg.contains("mlx_vlm") || msg.contains("dependency") {
+                    Text("pip install mlx-vlm Pillow")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.4))
+                        .textSelection(.enabled)
+                }
+                Button("RETRY") { runner.state = .idle; runner.start() }
+                    .font(.system(size: 9, weight: .black, design: .monospaced))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.orange)
+                    .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+// MARK: - Shared helpers (sliders, audio bar, overlays, preview)
 
 private struct LabeledSlider: View {
     let label: String
@@ -919,17 +1852,16 @@ private struct LabeledSlider: View {
     var format: String = "%.2f"
 
     var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text(label)
-                .font(.system(size: 9, weight: .black, design: .monospaced))
-                .foregroundColor(.white.opacity(0.5))
-                .frame(width: 68, alignment: .leading)
-            Slider(value: $value, in: range)
-                .tint(Color(hex: "FFE500"))
+                .font(.system(size: 11, weight: .black, design: .monospaced))
+                .foregroundColor(.white.opacity(0.6))
+                .frame(width: 78, alignment: .leading)
+            Slider(value: $value, in: range).tint(DS.yellow)
             Text(String(format: format, value))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(Color(hex: "FFE500"))
-                .frame(width: 44, alignment: .trailing)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(DS.yellow)
+                .frame(width: 52, alignment: .trailing)
         }
     }
 }
@@ -941,113 +1873,72 @@ private struct LabeledSliderFloat: View {
     var format: String = "%.2f"
 
     var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text(label)
-                .font(.system(size: 9, weight: .black, design: .monospaced))
-                .foregroundColor(.white.opacity(0.5))
-                .frame(width: 68, alignment: .leading)
-            Slider(value: $value, in: range)
-                .tint(Color(hex: "FFE500"))
+                .font(.system(size: 11, weight: .black, design: .monospaced))
+                .foregroundColor(.white.opacity(0.6))
+                .frame(width: 78, alignment: .leading)
+            Slider(value: $value, in: range).tint(DS.yellow)
             Text(String(format: format, value))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(Color(hex: "FFE500"))
-                .frame(width: 44, alignment: .trailing)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(DS.yellow)
+                .frame(width: 52, alignment: .trailing)
         }
     }
 }
-
-// MARK: - Audio level bar
-
-private struct AudioLevelBar: View {
-    let level: Float
-    let isActive: Bool
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color.white.opacity(0.08))
-                Rectangle()
-                    .fill(isActive ? Color(hex: "39FF14") : Color.white.opacity(0.2))
-                    .frame(width: geo.size.width * CGFloat(level))
-                    .animation(.linear(duration: 0.05), value: level)
-            }
-        }
-        .frame(height: 5)
-        .overlay(Rectangle().stroke(Color.white.opacity(0.1), lineWidth: 1))
-    }
-}
-
-// MARK: - Multi-subject overlay
 
 private struct SubjectsOverlayView: View {
-    let subjects: [DetectedSubject]
+    let subjects:    [DetectedSubject]
     let isFollowing: Bool
-    var height: CGFloat = 280
 
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width
             let h = geo.size.height
-
             ZStack {
-                // Frame-centre crosshair
                 Path { p in
-                    p.move(to: CGPoint(x: w / 2 - 10, y: h / 2))
-                    p.addLine(to: CGPoint(x: w / 2 + 10, y: h / 2))
-                    p.move(to: CGPoint(x: w / 2, y: h / 2 - 10))
-                    p.addLine(to: CGPoint(x: w / 2, y: h / 2 + 10))
+                    p.move(to: CGPoint(x: w/2-8, y: h/2)); p.addLine(to: CGPoint(x: w/2+8, y: h/2))
+                    p.move(to: CGPoint(x: w/2, y: h/2-8)); p.addLine(to: CGPoint(x: w/2, y: h/2+8))
                 }
-                .stroke(Color.white.opacity(0.3), lineWidth: 1)
+                .stroke(Color.white.opacity(0.2), lineWidth: 1)
 
                 ForEach(subjects.indices, id: \.self) { idx in
-                    let s = subjects[idx]
+                    let s  = subjects[idx]
                     let bb = s.bbox
                     let x  = bb.origin.x * w
                     let y  = (1 - bb.origin.y - bb.height) * h
                     let bw = bb.width  * w
                     let bh = bb.height * h
-
-                    let color: Color = s.isSpeaking ? Color(hex: "39FF14")
-                                     : s.isTracked  ? (isFollowing ? Color(hex: "00FFFF") : Color(hex: "FFE500"))
+                    let color: Color = s.isSpeaking ? DS.green
+                                     : s.isTracked  ? (isFollowing ? DS.cyan : DS.yellow)
                                      : .white.opacity(0.4)
-                    let lineWidth: CGFloat = (s.isTracked || s.isSpeaking) ? 2 : 1
-
+                    let lw: CGFloat = (s.isTracked || s.isSpeaking) ? 2 : 1
                     ZStack(alignment: .topLeading) {
-                        Rectangle()
-                            .stroke(color, lineWidth: lineWidth)
-                            .frame(width: bw, height: bh)
-
-                        let badgeText: String? = {
-                            if let lbl = s.speakerLabel {
-                                let n = (Int(lbl) ?? 0) + 1
-                                return s.isSpeaking ? "SPK \(n) ●" : "SPK \(n)"
-                            } else if s.isSpeaking {
-                                return "SPEAKING"
-                            } else if s.isTracked && subjects.count > 1 {
-                                return "TRACKED"
-                            }
-                            return nil
-                        }()
-                        if let badge = badgeText {
+                        Rectangle().stroke(color, lineWidth: lw).frame(width: bw, height: bh)
+                        if let badge = badgeText(s, count: subjects.count) {
                             Text(badge)
-                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .font(.system(size: 7, weight: .black, design: .monospaced))
                                 .foregroundColor(.black)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 2)
+                                .padding(.horizontal, 3).padding(.vertical, 1)
                                 .background(color)
-                                .offset(x: 0, y: -16)
+                                .offset(x: 0, y: -14)
                         }
                     }
-                    .position(x: x + bw / 2, y: y + bh / 2)
+                    .position(x: x + bw/2, y: y + bh/2)
                 }
             }
         }
-        .frame(height: height)
+    }
+
+    private func badgeText(_ s: DetectedSubject, count: Int) -> String? {
+        if let lbl = s.speakerLabel {
+            let n = (Int(lbl) ?? 0) + 1
+            return s.isSpeaking ? "SPK \(n) ●" : "SPK \(n)"
+        } else if s.isSpeaking { return "SPEAKING" }
+        else if s.isTracked && count > 1 { return "TRACKED" }
+        return nil
     }
 }
-
-// MARK: - Camera Preview (NSViewRepresentable)
 
 struct CameraPreviewView: NSViewRepresentable {
     @ObservedObject var tracker: CameraTracker
@@ -1064,24 +1955,24 @@ struct CameraPreviewView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        guard let previewLayer = nsView.layer?.sublayers?.first as? AVCaptureVideoPreviewLayer else { return }
-        previewLayer.session = tracker.captureSession
+        guard let layer = nsView.layer?.sublayers?.first as? AVCaptureVideoPreviewLayer else { return }
+        layer.session = tracker.captureSession
     }
 }
 
 // MARK: - Splat Map
 
 private struct SplatMapView: View {
-    let subjects: [SubjectMapEntry]
-    let currentYaw: Double
-    let currentPitch: Double
-    let sweepState: RoomSweepState
+    let subjects:        [SubjectMapEntry]
+    let currentYaw:      Double
+    let currentPitch:    Double
+    let sweepState:      RoomSweepState
     let sweepCurrentYaw: Double
     var sweepCurrentPitch: Double = 0
     var onTapSubject: ((SubjectMapEntry) -> Void)? = nil
 
-    private let yawMin: Double = -160
-    private let yawMax: Double =  160
+    private let yawMin:   Double = -160
+    private let yawMax:   Double =  160
     private let pitchMin: Double = -35
     private let pitchMax: Double =  35
 
@@ -1089,10 +1980,8 @@ private struct SplatMapView: View {
         GeometryReader { geo in
             let w = geo.size.width
             let h = geo.size.height
-
             ZStack {
-                Rectangle()
-                    .fill(Color.black)
+                Rectangle().fill(Color.black)
 
                 ForEach([-160, -90, 0, 90, 160], id: \.self) { deg in
                     let x = yawX(Double(deg), w: w)
@@ -1100,61 +1989,46 @@ private struct SplatMapView: View {
                         p.move(to: CGPoint(x: x, y: 0))
                         p.addLine(to: CGPoint(x: x, y: h))
                     }
-                    .stroke(Color.white.opacity(deg == 0 ? 0.25 : 0.08), lineWidth: 1)
-
+                    .stroke(Color.white.opacity(deg == 0 ? 0.2 : 0.06), lineWidth: 1)
                     Text("\(deg)°")
-                        .font(.system(size: 7, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.25))
+                        .font(.system(size: 6, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.2))
                         .position(x: x, y: h - 6)
                 }
 
                 Path { p in
                     let y = pitchY(0, h: h)
-                    p.move(to: CGPoint(x: 0, y: y))
-                    p.addLine(to: CGPoint(x: w, y: y))
+                    p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: w, y: y))
                 }
-                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
 
                 if sweepState == .sweeping {
                     let cx = yawX(sweepCurrentYaw, w: w)
                     let sy = pitchY(sweepCurrentPitch, h: h)
-                    Rectangle()
-                        .fill(Color(hex: "39FF14").opacity(0.15))
-                        .frame(width: 3, height: h)
-                        .position(x: cx, y: h / 2)
-                        .animation(.linear(duration: 0.3), value: sweepCurrentYaw)
-                    Rectangle()
-                        .fill(Color(hex: "39FF14").opacity(0.7))
-                        .frame(width: w, height: 2)
-                        .position(x: w / 2, y: sy)
-                        .animation(.linear(duration: 0.2), value: sweepCurrentPitch)
+                    Rectangle().fill(DS.green.opacity(0.15)).frame(width: 3, height: h)
+                        .position(x: cx, y: h/2).animation(.linear(duration: 0.3), value: sweepCurrentYaw)
+                    Rectangle().fill(DS.green.opacity(0.7)).frame(width: w, height: 2)
+                        .position(x: w/2, y: sy).animation(.linear(duration: 0.2), value: sweepCurrentPitch)
                 }
 
                 ForEach(subjects) { entry in
                     let x = yawX(entry.approximateYaw, w: w)
                     let y = pitchY(entry.approximatePitch, h: h)
-                    let label = entry.name ?? "\(entry.speakerNumber)"
                     ZStack(alignment: .bottom) {
                         ZStack {
-                            Circle()
-                                .fill(Color(hex: "00FFFF").opacity(0.2))
-                                .frame(width: 20, height: 20)
-                            Circle()
-                                .fill(Color(hex: "00FFFF"))
-                                .frame(width: 9, height: 9)
+                            Circle().fill(DS.cyan.opacity(0.2)).frame(width: 18, height: 18)
+                            Circle().fill(DS.cyan).frame(width: 8, height: 8)
                             Text("\(entry.speakerNumber)")
-                                .font(.system(size: 6, weight: .black, design: .monospaced))
+                                .font(.system(size: 5, weight: .black, design: .monospaced))
                                 .foregroundColor(.black)
                         }
-                        if entry.name != nil {
-                            Text(label)
-                                .font(.system(size: 7, weight: .black, design: .monospaced))
-                                .foregroundColor(Color(hex: "00FFFF"))
-                                .padding(.horizontal, 3)
-                                .padding(.vertical, 1)
+                        if let name = entry.name {
+                            Text(name)
+                                .font(.system(size: 6, weight: .black, design: .monospaced))
+                                .foregroundColor(DS.cyan)
+                                .padding(.horizontal, 2).padding(.vertical, 1)
                                 .background(Color.black.opacity(0.8))
-                                .overlay(Rectangle().stroke(Color(hex: "00FFFF").opacity(0.4), lineWidth: 1))
-                                .offset(y: 16)
+                                .offset(y: 14)
                         }
                     }
                     .position(x: x, y: y)
@@ -1166,152 +2040,60 @@ private struct SplatMapView: View {
                 let cx = yawX(currentYaw, w: w)
                 let cy = pitchY(currentPitch, h: h)
                 Path { p in
-                    p.move(to: CGPoint(x: cx - 7, y: cy)); p.addLine(to: CGPoint(x: cx + 7, y: cy))
-                    p.move(to: CGPoint(x: cx, y: cy - 7)); p.addLine(to: CGPoint(x: cx, y: cy + 7))
+                    p.move(to: CGPoint(x: cx-6, y: cy)); p.addLine(to: CGPoint(x: cx+6, y: cy))
+                    p.move(to: CGPoint(x: cx, y: cy-6)); p.addLine(to: CGPoint(x: cx, y: cy+6))
                 }
-                .stroke(Color.white.opacity(0.85), lineWidth: 1.5)
-
-                Circle()
-                    .stroke(Color.white.opacity(0.5), lineWidth: 1)
-                    .frame(width: 6, height: 6)
+                .stroke(Color.white.opacity(0.8), lineWidth: 1.5)
+                Circle().stroke(Color.white.opacity(0.4), lineWidth: 1).frame(width: 5, height: 5)
                     .position(x: cx, y: cy)
             }
             .clipShape(Rectangle())
-            .overlay(Rectangle().stroke(Color(hex: "39FF14").opacity(0.2), lineWidth: 1))
+            .overlay(Rectangle().stroke(DS.green.opacity(0.15), lineWidth: 1))
             .animation(.easeInOut(duration: 0.3), value: subjects.count)
         }
-        .frame(height: 90)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func yawX(_ yaw: Double, w: CGFloat) -> CGFloat {
         CGFloat((yaw - yawMin) / (yawMax - yawMin)) * w
     }
-
     private func pitchY(_ pitch: Double, h: CGFloat) -> CGFloat {
         CGFloat(1 - (pitch - pitchMin) / (pitchMax - pitchMin)) * h
     }
 }
 
-// MARK: - Person Tag Row
+// MARK: - Person tag row
 
 private struct PersonTagRow: View {
-    let entry: SubjectMapEntry
-    let onTap: () -> Void
+    let entry:        SubjectMapEntry
+    let onTap:        () -> Void
     let onNameChange: (String) -> Void
-    @State private var nameText: String = ""
+    @State private var nameText = ""
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Button(action: onTap) {
                 ZStack {
-                    Circle()
-                        .fill(Color(hex: "00FFFF").opacity(0.2))
-                        .frame(width: 16, height: 16)
+                    Circle().fill(DS.cyan.opacity(0.2)).frame(width: 14, height: 14)
                     Text("\(entry.speakerNumber)")
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
-                        .foregroundColor(Color(hex: "00FFFF"))
+                        .font(.system(size: 7, weight: .black, design: .monospaced))
+                        .foregroundColor(DS.cyan)
                 }
             }
             .buttonStyle(.plain)
-            .help("Click to point gimbal here")
 
             Text(String(format: "%.0f°,%.0f°", entry.approximateYaw, entry.approximatePitch))
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(.white.opacity(0.4))
-                .frame(width: 64, alignment: .leading)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundColor(.white.opacity(0.35))
+                .frame(width: 55, alignment: .leading)
 
             TextField("name…", text: $nameText)
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: 9, design: .monospaced))
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { onNameChange(nameText) }
                 .onChange(of: nameText) { _, v in onNameChange(v) }
         }
+        .padding(.vertical, 3)
         .onAppear { nameText = entry.name ?? "" }
-    }
-}
-
-// MARK: - MLX Status Row
-
-private struct MLXStatusRow: View {
-    @ObservedObject var runner: MLXRunner
-    @ObservedObject var journal: JournalAnalyzer
-
-    var body: some View {
-        switch runner.state {
-        case .idle:
-            Button {
-                runner.start()
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "cpu")
-                        .font(.system(size: 9))
-                    Text("LOAD MLX MODEL")
-                        .font(.system(size: 9, weight: .black, design: .monospaced))
-                }
-                .foregroundColor(.black)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Color(hex: "FFE500"))
-            }
-            .buttonStyle(.plain)
-
-        case .loading(let name):
-            HStack(spacing: 6) {
-                ProgressView().scaleEffect(0.55).tint(Color(hex: "FFE500"))
-                Text("LOADING \(name.uppercased())…")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(Color(hex: "FFE500").opacity(0.7))
-                Spacer()
-                Text("~30s")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.2))
-            }
-
-        case .ready:
-            HStack(spacing: 6) {
-                Rectangle()
-                    .fill(Color(hex: "39FF14"))
-                    .frame(width: 6, height: 6)
-                Text(journal.modelStatus.uppercased())
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.6))
-                Spacer()
-                if let path = journal.currentSessionPath {
-                    Button {
-                        NSWorkspace.shared.activateFileViewerSelecting([path])
-                    } label: {
-                        Image(systemName: "folder")
-                            .font(.system(size: 10))
-                            .foregroundColor(.white.opacity(0.4))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
-        case .error(let msg):
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundColor(.orange).font(.system(size: 9))
-                    Text(msg.uppercased())
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.orange)
-                        .lineLimit(2)
-                }
-                if msg.contains("mlx_lm") {
-                    Text("pip install mlx-lm")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.4))
-                        .textSelection(.enabled)
-                }
-                Button("RETRY") { runner.state = .idle; runner.start() }
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange)
-                    .buttonStyle(.plain)
-            }
-        }
     }
 }
