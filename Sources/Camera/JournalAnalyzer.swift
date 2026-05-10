@@ -75,6 +75,18 @@ final class JournalAnalyzer: ObservableObject {
     @Published var latestObservation: SceneObservation? = nil
     @Published var isWriting = false
 
+    // ── Pipeline visualization (consumed by the operator console pipeline strip) ──
+    /// Live mirror of the ring buffer thumbnails (oldest → newest), updated each
+    /// time a frame is captured. UI shows these as the "next-grid" preview.
+    @Published var bufferThumbs: [CGImage] = []
+    /// Composed 2×2 grid currently being analyzed by the VLM, or nil if idle.
+    @Published var inflightGrid:      CGImage? = nil
+    /// When the in-flight request started — used to render an elapsed-time pill.
+    @Published var inflightStartedAt: Date?    = nil
+    /// Number of beats that were skipped because a previous one was still in-flight.
+    /// (Currently we serialize so this stays at 0; reserved for future parallelism.)
+    @Published var queuedCount: Int = 0
+
     var frameInterval: TimeInterval = 3.0
     var writeCooldown: TimeInterval = 20.0
 
@@ -166,6 +178,8 @@ final class JournalAnalyzer: ObservableObject {
         if frameBuffer.count > frameBufferCapacity {
             frameBuffer.removeFirst(frameBuffer.count - frameBufferCapacity)
         }
+        // Mirror to UI for the pipeline strip (oldest → newest)
+        bufferThumbs = frameBuffer.map { $0.image }
 
         // Capture subject positions on MainActor before going to the background queue
         let subjects = tracker.allSubjects
@@ -261,11 +275,18 @@ final class JournalAnalyzer: ObservableObject {
         isWriting = true
         modelStatus = "Looking…"
 
-        // Build the temporal 2×2 composite from the ring buffer.
+        // Build the temporal 2×2 composite from the ring buffer + a full-res
+        // latest frame. The model sees both: grid for change-over-time, full-res
+        // for fine details (faces, screens, hands).
         let bufferSnapshot = frameBuffer
         let composite = Self.composeTemporalGrid(buffer: bufferSnapshot)
-        let frame: CGImage? = composite ?? tracker?.captureCurrentFrame()
+        let latestFrame = bufferSnapshot.last?.image ?? tracker?.captureCurrentFrame()
         if let composite { Self.writeDebugComposite(composite) }
+        // Build the image array sent to the VLM. When we only have one frame
+        // (no history yet), skip the grid and send just the latest.
+        var vlmImages: [CGImage] = []
+        if let composite, bufferSnapshot.count >= 2 { vlmImages.append(composite) }
+        if let latestFrame { vlmImages.append(latestFrame) }
 
         let oneLiner = obs.oneLiner
         let recentSpeech = transcriber.flatMap { t -> String? in
@@ -285,12 +306,18 @@ final class JournalAnalyzer: ObservableObject {
         let useClaudeSynth = claudeAgent?.isConfigured == true
         let rawObsSnapshot = rawObservations
 
+        // Publish in-flight grid for the pipeline strip BEFORE going off-actor.
+        let inflightGridForUI = composite
+        let inflightStart = Date()
+        self.inflightGrid      = inflightGridForUI
+        self.inflightStartedAt = inflightStart
+
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             do {
                 // ── Step 1: local VLM produces a raw description ──
                 let raw: String = try await withThrowingTaskGroup(of: String.self) { group in
-                    group.addTask { try await self.runner.query(vlmPrompt, image: frame, maxTokens: 60) }
+                    group.addTask { try await self.runner.query(vlmPrompt, images: vlmImages, maxTokens: 60) }
                     group.addTask {
                         try await Task.sleep(nanoseconds: 45_000_000_000)
                         throw MLXError.inferenceError("Timeout")
@@ -347,6 +374,8 @@ final class JournalAnalyzer: ObservableObject {
                     if Self.tooSimilarToRecent(finalSentence, recent: self.recentBeatSentences) {
                         self.isWriting   = false
                         self.modelStatus = "Running"
+                        self.inflightGrid      = nil
+                        self.inflightStartedAt = nil
                         return
                     }
                     let beat = NarrativeBeat(sentence: finalSentence, trigger: change, mode: finalMode)
@@ -361,6 +390,8 @@ final class JournalAnalyzer: ObservableObject {
                     self.appendBeatToDisk(beat)
                     self.isWriting   = false
                     self.modelStatus = "Running"
+                    self.inflightGrid      = nil
+                    self.inflightStartedAt = nil
                     let synthTag = usedClaude ? "claude" : "vlm-only"
                     self.logger.info("Beat[\(finalMode.rawValue, privacy: .public)/\(synthTag, privacy: .public)] \(finalSentence, privacy: .public) | raw: \(rawDesc, privacy: .public)")
                 }
@@ -368,6 +399,8 @@ final class JournalAnalyzer: ObservableObject {
                 await MainActor.run { [weak self] in
                     self?.isWriting   = false
                     self?.modelStatus = "Running"
+                    self?.inflightGrid      = nil
+                    self?.inflightStartedAt = nil
                     self?.logger.error("Beat pipeline failed: \(error.localizedDescription)")
                 }
             }
@@ -410,24 +443,42 @@ final class JournalAnalyzer: ObservableObject {
     /// a plain CONCRETE description: room, person, posture, action. Claude then
     /// synthesizes the polished beat downstream.
     private func buildVLMDescriptionPrompt(frameCount: Int, spanSec: Int) -> String {
+        // The small VLM's failure mode is filler ("pale walls, soft lighting,
+        // a serene atmosphere"). We force it onto specifics: who is present,
+        // what their hands/gaze are doing, what objects they're touching or
+        // looking at, and the inferred activity. Lighting/walls/atmosphere
+        // are explicitly forbidden unless they ARE the subject of the frame.
         let base = """
-        Describe what you see in ONE concrete sentence (max 25 words). Cover:
-          • the room/setting (lighting, walls, objects visible)
-          • the person (posture, clothing, expression)
-          • what they're physically doing right now
-        Be observational and factual. NO advice, NO coaching, NO interpretation.
+        You are the eye of a memory device. Report what is happening — not how it looks.
+
+        Output ONE sentence, max 30 words, with these elements in order:
+          1. PEOPLE: count + role if obvious (e.g. "a woman at a desk", "two people facing each other")
+          2. ACTION: what their hands / posture / gaze are doing right now (specific verbs: typing, pointing, holding a mug, looking at a phone, leaning forward)
+          3. OBJECTS: the 1–3 things they are interacting with or looking at (laptop, notebook, mug, phone, another person)
+          4. PLACE: one short tag only if clearly identifiable (kitchen, desk, sidewalk, bedroom). Skip if generic.
+
+        HARD RULES:
+          • Do NOT describe lighting, wall color, mood, atmosphere, or aesthetic.
+          • Do NOT use words like "serene", "cozy", "warm light", "pale", "soft", "minimal".
+          • If the frame shows nothing meaningful happening, say exactly: "Nothing notable — empty room." and stop.
+          • No advice, no coaching, no questions, no second person. Third-person factual only.
+
+        Good: "A man at a desk types on a laptop while glancing at a phone beside the keyboard."
+        Bad:  "A peaceful workspace with soft natural light and a sense of calm focus."
         """
         if frameCount >= 2 {
-            return base + "\n\nThese frames span the last \(spanSec)s, oldest on the left, latest on the right (yellow border). If anything changed across them, mention the change."
+            return base + "\n\nYou are receiving two images of the same scene:\n  • Image 1: a 2×2 grid of \(frameCount) frames in chronological order (top-left = oldest, bottom-right = newest, span ≈ \(spanSec)s).\n  • Image 2: the newest frame at full resolution — use this for fine details (faces, screens, objects).\n\nDescribe what is happening in the newest frame. If a hand/gaze/object position changed across the grid, append a short clause (4–6 words) naming the change."
         }
         return base
     }
 
     // MARK: - Temporal grid composer (Path A + C)
 
-    /// Composites up to 4 frames into a 2×2 grid. The newest frame (bottom-right)
-    /// carries a translucent red diff overlay marking pixels that changed since the
-    /// previous frame, giving the VLM explicit visual attention cues for motion.
+    /// Composites up to 4 frames into a clean 2×2 grid (no annotations).
+    /// The model is told via the prompt that frames are in chronological order
+    /// (top-left oldest → bottom-right newest); we trust it to read order from
+    /// content rather than overlaying borders or diff highlights, which add
+    /// pixel noise and bias small VLMs toward describing the markings.
     nonisolated static func composeTemporalGrid(
         buffer: [(image: CGImage, timestamp: Date)]
     ) -> CGImage? {
@@ -471,26 +522,9 @@ final class JournalAnalyzer: ObservableObject {
             ctx.clip(to: cellRect)
             ctx.draw(item.image, in: cellRect)
             ctx.restoreGState()
-
-            // Red diff overlay on the NEWEST cell (only if we have a previous frame)
-            if i == buffer.count - 1, i > 0 {
-                let prev = buffer[i - 1].image
-                if let overlay = computeDiffOverlay(prev: prev, curr: item.image, w: cellW, h: cellH) {
-                    ctx.saveGState()
-                    ctx.draw(overlay, in: cellRect)
-                    ctx.restoreGState()
-                }
-            }
-
-            // Yellow border on the NEWEST cell to make "now" obvious to the VLM
-            if i == buffer.count - 1 {
-                ctx.setStrokeColor(CGColor(red: 1.0, green: 0.9, blue: 0.0, alpha: 0.85))
-                ctx.setLineWidth(3)
-                ctx.stroke(cellRect.insetBy(dx: 1.5, dy: 1.5))
-            }
         }
 
-        // Thin divider lines between cells
+        // Thin neutral divider lines so adjacent cells don't blur into each other.
         ctx.setStrokeColor(CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 0.4))
         ctx.setLineWidth(1)
         ctx.move(to:    CGPoint(x: cellW,        y: 0))
@@ -512,66 +546,6 @@ final class JournalAnalyzer: ObservableObject {
         guard let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
         else { return }
         try? data.write(to: url)
-    }
-
-    /// Per-pixel max-channel absolute difference between two frames. Returns a
-    /// transparent RGBA overlay where motion regions are tinted red, alpha scaled
-    /// by motion magnitude. Returns nil if no significant change is detected.
-    nonisolated static func computeDiffOverlay(
-        prev: CGImage, curr: CGImage, w: Int, h: Int
-    ) -> CGImage? {
-        func render(_ image: CGImage) -> [UInt8]? {
-            var bytes = [UInt8](repeating: 0, count: w * h * 4)
-            let ok = bytes.withUnsafeMutableBufferPointer { buf -> Bool in
-                guard let c = CGContext(
-                    data: buf.baseAddress, width: w, height: h,
-                    bitsPerComponent: 8, bytesPerRow: w * 4,
-                    space: CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                ) else { return false }
-                c.interpolationQuality = .medium
-                c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-                return true
-            }
-            return ok ? bytes : nil
-        }
-
-        guard let p = render(prev), let c = render(curr) else { return nil }
-
-        var out = [UInt8](repeating: 0, count: w * h * 4)
-        var movedPixels = 0
-        let threshold = 30
-        for i in 0..<(w * h) {
-            let dr = abs(Int(p[i*4])   - Int(c[i*4]))
-            let dg = abs(Int(p[i*4+1]) - Int(c[i*4+1]))
-            let db = abs(Int(p[i*4+2]) - Int(c[i*4+2]))
-            let d  = max(dr, max(dg, db))
-            if d > threshold {
-                let alpha = UInt8(min(170, d * 2))
-                // Premultiplied red — alpha is already baked into the channels
-                out[i*4]   = UInt8((255 * Int(alpha)) / 255) // R · α
-                out[i*4+1] = UInt8((40  * Int(alpha)) / 255) // G · α
-                out[i*4+2] = UInt8((40  * Int(alpha)) / 255) // B · α
-                out[i*4+3] = alpha
-                movedPixels += 1
-            }
-        }
-        // Skip overlay if essentially nothing changed (< 0.5% of pixels)
-        guard movedPixels > (w * h) / 200 else { return nil }
-
-        guard let cf = out.withUnsafeBufferPointer({ CFDataCreate(nil, $0.baseAddress, $0.count) }),
-              let provider = CGDataProvider(data: cf)
-        else { return nil }
-
-        return CGImage(
-            width: w, height: h,
-            bitsPerComponent: 8, bitsPerPixel: 32,
-            bytesPerRow: w * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-            provider: provider, decode: nil,
-            shouldInterpolate: false, intent: .defaultIntent
-        )
     }
 
     // MARK: - Vision pipeline

@@ -195,9 +195,231 @@ private struct AIPane: View {
             InsightCard(tracker: tracker)
                 .frame(minHeight: 200, maxHeight: 260)
             Rectangle().fill(DS.divider).frame(height: 1)
+            PipelinePanel(journal: tracker.journalAnalyzer)
+            Rectangle().fill(DS.divider).frame(height: 1)
             CommandBox(tracker: tracker)
                 .frame(maxHeight: .infinity)
         }
+    }
+}
+
+// MARK: - Pipeline panel (collapsible: ring buffer → grid → in-flight → beat)
+
+private struct PipelinePanel: View {
+    @ObservedObject var journal: JournalAnalyzer
+    @State private var expanded: Bool = false
+    /// Drives elapsed-time text while a request is in-flight.
+    @State private var tick: Date = Date()
+    private let pulse = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header — always visible, collapses/expands the body
+            Button(action: { withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() } }) {
+                HStack(spacing: 6) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .black))
+                        .foregroundColor(.white.opacity(0.6))
+                    Text("PIPELINE")
+                        .font(.system(size: 8, weight: .black, design: .monospaced))
+                        .tracking(2)
+                        .foregroundColor(.white.opacity(0.6))
+                    Spacer()
+                    if journal.inflightStartedAt != nil {
+                        Circle().fill(DS.yellow).frame(width: 5, height: 5)
+                        Text("ANALYZING")
+                            .font(.system(size: 7, weight: .black, design: .monospaced))
+                            .foregroundColor(DS.yellow)
+                    } else if journal.isAnalyzing {
+                        Circle().fill(DS.green).frame(width: 5, height: 5)
+                        Text("IDLE")
+                            .font(.system(size: 7, weight: .black, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                pipelineBody
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 9)
+            }
+        }
+        .background(DS.surface2)
+        .onReceive(pulse) { now in
+            // Only force redraws while a request is in-flight (saves CPU when idle)
+            if journal.inflightStartedAt != nil { tick = now }
+        }
+    }
+
+    @ViewBuilder
+    private var pipelineBody: some View {
+        HStack(alignment: .center, spacing: 8) {
+            bufferStage
+            arrow
+            gridStage
+            arrow
+            inflightStage
+            arrow
+            beatStage
+        }
+    }
+
+    // ── Stage 1: ring buffer thumbnails (oldest → newest)
+    private var bufferStage: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("BUFFER")
+                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .tracking(1).foregroundColor(.white.opacity(0.4))
+            HStack(spacing: 2) {
+                ForEach(0..<4, id: \.self) { idx in
+                    bufferCell(at: idx)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bufferCell(at idx: Int) -> some View {
+        let thumbs = journal.bufferThumbs
+        let isNewest = !thumbs.isEmpty && idx == thumbs.count - 1
+        ZStack {
+            Rectangle()
+                .fill(Color.white.opacity(0.04))
+                .frame(width: 28, height: 18)
+            if idx < thumbs.count {
+                Image(decorative: thumbs[idx], scale: 1.0, orientation: .up)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 28, height: 18)
+                    .clipped()
+            }
+            Rectangle()
+                .stroke(isNewest ? DS.yellow.opacity(0.9) : Color.white.opacity(0.1),
+                        lineWidth: isNewest ? 1.2 : 0.5)
+                .frame(width: 28, height: 18)
+        }
+        .scaleEffect(isNewest ? 1.04 : 1.0)
+        .animation(.easeOut(duration: 0.18), value: thumbs.count)
+    }
+
+    // ── Stage 2: composed grid preview (the next-to-send 2×2)
+    private var gridStage: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("GRID")
+                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .tracking(1).foregroundColor(.white.opacity(0.4))
+            ZStack {
+                Rectangle()
+                    .fill(Color.white.opacity(0.04))
+                    .frame(width: 56, height: 36)
+                if let g = nextGridPreview {
+                    Image(decorative: g, scale: 1.0, orientation: .up)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 56, height: 36)
+                }
+                Rectangle()
+                    .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                    .frame(width: 56, height: 36)
+            }
+        }
+    }
+
+    /// The grid that *would* be sent right now if a beat fired. Shows what's
+    /// being assembled in parallel even while a previous request is in-flight.
+    private var nextGridPreview: CGImage? {
+        let buffer = journal.bufferThumbs
+        guard buffer.count >= 2 else { return nil }
+        let pairs = buffer.map { (image: $0, timestamp: Date()) }
+        return JournalAnalyzer.composeTemporalGrid(buffer: pairs)
+    }
+
+    // ── Stage 3: in-flight request
+    private var inflightStage: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("VLM")
+                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .tracking(1).foregroundColor(.white.opacity(0.4))
+            ZStack {
+                Rectangle()
+                    .fill(Color.white.opacity(0.04))
+                    .frame(width: 56, height: 36)
+                if let g = journal.inflightGrid {
+                    Image(decorative: g, scale: 1.0, orientation: .up)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 56, height: 36)
+                        .opacity(0.55)
+                    // Spinner + elapsed
+                    VStack(spacing: 1) {
+                        ProgressView()
+                            .scaleEffect(0.45)
+                            .progressViewStyle(.circular)
+                            .tint(DS.yellow)
+                        Text(elapsedText)
+                            .font(.system(size: 6, weight: .black, design: .monospaced))
+                            .foregroundColor(DS.yellow)
+                    }
+                } else {
+                    Text("—")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.2))
+                }
+                Rectangle()
+                    .stroke(journal.inflightGrid != nil ? DS.yellow.opacity(0.6) : Color.white.opacity(0.1),
+                            lineWidth: journal.inflightGrid != nil ? 1.0 : 0.5)
+                    .frame(width: 56, height: 36)
+            }
+        }
+    }
+
+    private var elapsedText: String {
+        guard let s = journal.inflightStartedAt else { return "" }
+        let dt = max(0, tick.timeIntervalSince(s))
+        return String(format: "%.1fs", dt)
+    }
+
+    // ── Stage 4: latest beat
+    private var beatStage: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("BEAT")
+                .font(.system(size: 6, weight: .black, design: .monospaced))
+                .tracking(1).foregroundColor(.white.opacity(0.4))
+            ZStack(alignment: .topLeading) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.04))
+                    .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
+                if let beat = journal.latestBeat {
+                    Text(beat.sentence)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.85))
+                        .lineLimit(3)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 3)
+                } else {
+                    Text("—")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.2))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 3)
+                }
+                Rectangle()
+                    .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+            }
+            .frame(height: 36)
+        }
+    }
+
+    private var arrow: some View {
+        Image(systemName: "arrow.right")
+            .font(.system(size: 8, weight: .bold))
+            .foregroundColor(.white.opacity(0.25))
+            .padding(.top, 12)
     }
 }
 
@@ -1034,15 +1256,37 @@ private struct StreamPane: View {
                     .foregroundColor(.white.opacity(0.12))
             }
 
+            // Click-to-lock: tap a spot on the feed to lock follow onto the
+            // subject closest to that point. Tap again on empty area to clear.
+            GeometryReader { geo in
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { loc in
+                        let nx = loc.x / max(1, geo.size.width)
+                        // SwiftUI tap is top-left origin; Vision bbox is bottom-left.
+                        let ny = 1 - (loc.y / max(1, geo.size.height))
+                        let p = CGPoint(x: max(0, min(1, nx)), y: max(0, min(1, ny)))
+                        // Tap on (or very near) the current lock = clear it.
+                        if let cur = tracker.lockedTargetPoint,
+                           hypot(cur.x - p.x, cur.y - p.y) < 0.08 {
+                            tracker.clearSubjectLock()
+                        } else {
+                            tracker.aimAt(normalizedPoint: p)
+                        }
+                    }
+            }
+
             // Subject bboxes
             if !tracker.allSubjects.isEmpty {
                 SubjectsOverlayView(subjects: tracker.allSubjects,
-                                    isFollowing: tracker.isFollowing)
+                                    isFollowing: tracker.isFollowing,
+                                    lockPoint: tracker.lockedTargetPoint)
             } else if let bbox = tracker.detectedBbox {
                 SubjectsOverlayView(
                     subjects: [DetectedSubject(bbox: bbox, isSpeaking: false,
                                                isTracked: true, speakerLabel: nil)],
-                    isFollowing: tracker.isFollowing
+                    isFollowing: tracker.isFollowing,
+                    lockPoint: tracker.lockedTargetPoint
                 )
             }
 
@@ -1890,6 +2134,7 @@ private struct LabeledSliderFloat: View {
 private struct SubjectsOverlayView: View {
     let subjects:    [DetectedSubject]
     let isFollowing: Bool
+    var lockPoint:   CGPoint? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -1901,6 +2146,20 @@ private struct SubjectsOverlayView: View {
                     p.move(to: CGPoint(x: w/2, y: h/2-8)); p.addLine(to: CGPoint(x: w/2, y: h/2+8))
                 }
                 .stroke(Color.white.opacity(0.2), lineWidth: 1)
+
+                // Click-lock target indicator (bottom-left origin → flip y)
+                if let lock = lockPoint {
+                    let lx = lock.x * w
+                    let ly = (1 - lock.y) * h
+                    Circle()
+                        .stroke(DS.cyan, lineWidth: 2)
+                        .frame(width: 22, height: 22)
+                        .position(x: lx, y: ly)
+                    Circle()
+                        .fill(DS.cyan)
+                        .frame(width: 4, height: 4)
+                        .position(x: lx, y: ly)
+                }
 
                 ForEach(subjects.indices, id: \.self) { idx in
                     let s  = subjects[idx]

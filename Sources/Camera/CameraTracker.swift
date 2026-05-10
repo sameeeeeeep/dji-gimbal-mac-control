@@ -70,8 +70,8 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var isScanning = false
     /// True while an open-palm gesture is actively guiding the gimbal.
     @Published var palmGestureActive = false
-    /// True while a thumbs-up has locked the gimbal in place (even during follow mode).
-    /// Show another thumbs-up or open palm to unlock.
+    /// True while a peace-sign (index + middle extended) has locked the gimbal
+    /// in place. Show another peace-sign or open palm to unlock.
     @Published var followLocked = false
     /// True while a pointing gesture is actively driving a seek-and-return.
     @Published var pointingGestureActive = false
@@ -276,10 +276,10 @@ final class CameraTracker: NSObject, ObservableObject {
     private let logger = Logger(subsystem: "com.gimbal.controller", category: "Camera")
     nonisolated(unsafe) private var bgTrackingType: TrackingType = .face
     nonisolated(unsafe) private var bgPalmFrameCount: Int = 0
-    nonisolated(unsafe) private var bgThumbsUpFrameCount: Int = 0
+    nonisolated(unsafe) private var bgPeaceFrameCount: Int = 0
     nonisolated(unsafe) private var bgPointingFrameCount: Int = 0
     private let palmConfirmFrames: Int = 20  // ~0.67 s at 30 fps
-    private let thumbsUpConfirmFrames: Int = 15   // ~0.5 s
+    private let peaceConfirmFrames: Int = 15   // ~0.5 s
     private let pointingConfirmFrames: Int = 12   // ~0.4 s
 
     // --- Smoothed output (EMA filter — kills oscillation at any gain) ---
@@ -299,6 +299,22 @@ final class CameraTracker: NSObject, ObservableObject {
     // --- Reacquisition debounce (prevent scan reset from flicker) ---
     private var consecutiveDetections: Int = 0
     private let reacquireThreshold: Int = 5  // need 5 consecutive frames (~170ms) to confirm
+
+    // --- Bbox loss debounce (prevent scan from triggering on a single dropped frame) ---
+    /// Last non-nil bbox we saw, with the time we saw it. The follow loop keeps
+    /// tracking this stale bbox for `bboxGraceSeconds` before declaring lost.
+    private var lastSeenBbox: CGRect?
+    private var lastSeenBboxTime: Date?
+    private let bboxGraceSeconds: TimeInterval = 0.4   // ~12 dropped frames at 30fps
+
+    // --- Click-to-lock subject ---
+    /// When set, the follow loop only tracks the subject whose bbox center is
+    /// closest to this normalised point. Cleared by tapping the same area again
+    /// or calling clearSubjectLock().
+    @Published var lockedTargetPoint: CGPoint? = nil
+    /// Last bbox of the locked subject, used as the tracking source even when
+    /// face detection is briefly noisy.
+    private var lockedSubjectBbox: CGRect?
 
     // Gimbal mechanical limits (degrees)
     private let yawMin: Double = -160
@@ -331,6 +347,24 @@ final class CameraTracker: NSObject, ObservableObject {
         let session = AVCaptureSession()
         guard let input = try? AVCaptureDeviceInput(device: camera) else { return }
         if session.canAddInput(input) { session.addInput(input) }
+
+        // Audio: prefer the mic on the same device as the selected camera
+        // (Continuity Camera exposes paired audio under the same localizedName).
+        let audioDiscovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external, .continuityCamera],
+            mediaType: .audio, position: .unspecified
+        )
+        let audioDevice = audioDiscovery.devices.first(where: { $0.localizedName == camera.localizedName })
+            ?? audioDiscovery.devices.first(where: { $0.deviceType == .continuityCamera })
+            ?? AVCaptureDevice.default(for: .audio)
+        if let mic = audioDevice,
+           let micInput = try? AVCaptureDeviceInput(device: mic),
+           session.canAddInput(micInput) {
+            session.addInput(micInput)
+            logger.info("Audio input: \(mic.localizedName)")
+        } else {
+            logger.warning("No audio input available — recordings will be silent")
+        }
 
         let videoOutput = AVCaptureVideoDataOutput()
         videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -645,12 +679,54 @@ final class CameraTracker: NSObject, ObservableObject {
                 logTick += 1
                 let shouldLog = (logTick % 15 == 0)
 
-                // Palm guide takes priority over face detection bbox
-                let activeBbox = self.palmGuideBbox ?? self.detectedBbox
-                if let bbox = activeBbox {
+                // Pick the active bbox.
+                //   1. Palm guide always wins (explicit user gesture).
+                //   2. If a click-lock is active, pick the subject closest to the lock point.
+                //   3. Otherwise the most-confident face bbox.
+                let palm = self.palmGuideBbox
+                let chosenBbox: CGRect? = {
+                    if let palm { return palm }
+                    if let lock = self.lockedTargetPoint {
+                        let candidates = self.allSubjects.map { $0.bbox }
+                        let pool = candidates.isEmpty ? [self.detectedBbox].compactMap { $0 } : candidates
+                        let best = pool.min(by: { a, b in
+                            let da = hypot(a.midX - lock.x, a.midY - lock.y)
+                            let db = hypot(b.midX - lock.x, b.midY - lock.y)
+                            return da < db
+                        })
+                        if let best {
+                            self.lockedSubjectBbox = best
+                            return best
+                        }
+                        // No candidates this frame — fall through to grace-period logic
+                        // by returning nil so we keep tracking lockedSubjectBbox briefly.
+                        return nil
+                    }
+                    return self.detectedBbox
+                }()
+
+                // Update the seen-bbox grace buffer
+                if let bbox = chosenBbox {
+                    self.lastSeenBbox = bbox
+                    self.lastSeenBboxTime = Date()
+                }
+
+                // Within grace window? Treat a missing bbox as "still here".
+                let graceActive: Bool = {
+                    guard chosenBbox == nil,
+                          let last = self.lastSeenBboxTime else { return false }
+                    return Date().timeIntervalSince(last) < self.bboxGraceSeconds
+                }()
+
+                let trackingBbox: CGRect? = chosenBbox ?? (graceActive ? self.lastSeenBbox : nil)
+
+                if let bbox = trackingBbox {
                     if self.isScanning {
-                        // Mid-scan: require sustained detection before aborting scan
-                        self.consecutiveDetections += 1
+                        // Mid-scan: require sustained detection before aborting scan.
+                        // Only count REAL detections (not grace-buffer holds) toward reacquire.
+                        if chosenBbox != nil {
+                            self.consecutiveDetections += 1
+                        }
                         if self.consecutiveDetections >= self.reacquireThreshold {
                             self.logger.error("FOLLOW: face confirmed after \(self.consecutiveDetections, privacy: .public) frames — resuming track")
                             self.resetSearchState()
@@ -661,11 +737,70 @@ final class CameraTracker: NSObject, ObservableObject {
                         self.trackFace(bbox, shouldLog: shouldLog)
                     }
                 } else {
+                    // Truly lost — past the grace window. Clear stale lock bbox and search.
                     self.consecutiveDetections = 0
+                    self.lockedSubjectBbox = nil
                     self.searchForFace(shouldLog: shouldLog)
                 }
             }
         }
+    }
+
+    /// Click-to-aim. The user clicked at a normalised point in the camera preview
+    /// (origin bottom-left, [0,1]). We pan the gimbal so that point becomes the
+    /// new center, and — if a subject is near that point — also lock follow onto
+    /// it so it stays centered when it moves.
+    ///
+    /// If the click is in empty space (no subject nearby), follow is stopped so
+    /// the manual pan doesn't fight the follow loop, and any existing lock is
+    /// cleared.
+    func aimAt(normalizedPoint p: CGPoint) {
+        // Convert preview offset → angle delta. Camera horizontal FOV is ~65°
+        // for the iPhone Continuity Camera; vertical scales by the 16:9 aspect.
+        let dx = p.x - 0.5
+        let dy = p.y - 0.5  // bottom-left origin: positive y = up
+        let yawDelta:   Double = dx * cameraFOVDeg
+        let pitchDelta: Double = dy * cameraFOVDeg * (9.0 / 16.0)
+
+        let cur = getCurrentPosition?() ?? GimbalPosition()
+        let targetYaw   = max(yawMin,   min(yawMax,   cur.yaw   + yawDelta))
+        let targetPitch = max(pitchMin, min(pitchMax, cur.pitch + pitchDelta))
+
+        // Decide whether the click landed on a subject. Threshold is ~12% in
+        // normalised preview coords — generous enough that you don't need to
+        // hit the bbox center exactly.
+        let hitSubject = allSubjects.first(where: { s in
+            hypot(s.bbox.midX - p.x, s.bbox.midY - p.y) < 0.12
+        }) ?? (detectedBbox.flatMap { bb -> DetectedSubject? in
+            hypot(bb.midX - p.x, bb.midY - p.y) < 0.12
+                ? DetectedSubject(bbox: bb, isSpeaking: false, isTracked: true, speakerLabel: nil)
+                : nil
+        })
+
+        if hitSubject != nil {
+            // Lock onto the subject. Start follow so it stays centered when it moves.
+            lockedTargetPoint = p
+            lockedSubjectBbox = nil
+            if !isFollowing { startFollow() }
+            // Pan there now; the follow loop will fine-tune as new bboxes arrive.
+            navigateTo(yaw: targetYaw, pitch: targetPitch)
+            logger.info("AIM: subject lock at (\(String(format: "%.2f", p.x), privacy: .public),\(String(format: "%.2f", p.y), privacy: .public)) → yaw=\(String(format: "%.0f", targetYaw), privacy: .public) pitch=\(String(format: "%.0f", targetPitch), privacy: .public)")
+        } else {
+            // Empty-space click. Stop follow so the pan isn't immediately
+            // reversed, and clear any existing subject lock.
+            lockedTargetPoint = nil
+            lockedSubjectBbox = nil
+            if isFollowing { stopFollow() }
+            navigateTo(yaw: targetYaw, pitch: targetPitch)
+            logger.info("AIM: empty-space pan → yaw=\(String(format: "%.0f", targetYaw), privacy: .public) pitch=\(String(format: "%.0f", targetPitch), privacy: .public)")
+        }
+    }
+
+    /// Release a click-lock and stop any in-progress aim navigation.
+    func clearSubjectLock() {
+        lockedTargetPoint = nil
+        lockedSubjectBbox = nil
+        logger.info("LOCK: cleared")
     }
 
     func stopFollow() {
@@ -673,6 +808,9 @@ final class CameraTracker: NSObject, ObservableObject {
         followTimer = nil
         isFollowing = false
         resetSearchState()
+        lastSeenBbox = nil
+        lastSeenBboxTime = nil
+        lockedSubjectBbox = nil
         smoothedYaw = 0
         smoothedPitch = 0
         onSpeedCommand?(0, 0)
@@ -1480,7 +1618,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             let wasPalm    = bgPalmFrameCount    >= palmConfirmFrames
             let wasPointing = bgPointingFrameCount >= pointingConfirmFrames
             bgPalmFrameCount     = 0
-            bgThumbsUpFrameCount = 0
+            bgPeaceFrameCount = 0
             bgPointingFrameCount = 0
             if wasPalm || wasPointing {
                 Task { @MainActor [weak self] in
@@ -1497,12 +1635,12 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             return
         }
 
-        // ── Thumbs-up: lock/unlock ────────────────────────────────────────────
-        if isThumbsUp(obs) {
-            bgThumbsUpFrameCount = min(bgThumbsUpFrameCount + 1, thumbsUpConfirmFrames + 1)
+        // ── Peace sign (index + middle): lock/unlock ──────────────────────────
+        if isPeaceSign(obs) {
+            bgPeaceFrameCount = min(bgPeaceFrameCount + 1, peaceConfirmFrames + 1)
             bgPalmFrameCount     = 0
             bgPointingFrameCount = 0
-            if bgThumbsUpFrameCount == thumbsUpConfirmFrames {
+            if bgPeaceFrameCount == peaceConfirmFrames {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.followLocked.toggle()
@@ -1514,7 +1652,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             return
         }
-        bgThumbsUpFrameCount = 0
+        bgPeaceFrameCount = 0
 
         // ── Pointing: rotate toward pointed direction, search for subject ─────
         if let tipPos = pointingTip(obs),
@@ -1683,26 +1821,40 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         pointingGestureActive = false
     }
 
-    /// Returns true when the hand looks like a thumbs-up:
-    /// thumb tip clearly above wrist, all other fingertips folded near the wrist.
-    nonisolated private func isThumbsUp(_ obs: VNHumanHandPoseObservation) -> Bool {
-        guard let points   = try? obs.recognizedPoints(.all) else { return false }
-        guard let wrist    = points[.wrist],    wrist.confidence    > 0.5 else { return false }
-        guard let thumbTip = points[.thumbTip], thumbTip.confidence > 0.5 else { return false }
+    /// Returns true when the hand looks like a peace sign (✌️):
+    /// index AND middle fingertips both clearly extended from the wrist,
+    /// ring AND little fingertips folded near the wrist. Thumb is unconstrained.
+    /// The index/middle pair must also be visibly separated so this won't
+    /// trigger on a single-finger point.
+    nonisolated private func isPeaceSign(_ obs: VNHumanHandPoseObservation) -> Bool {
+        guard let points    = try? obs.recognizedPoints(.all) else { return false }
+        guard let wrist     = points[.wrist],     wrist.confidence     > 0.5 else { return false }
+        guard let indexTip  = points[.indexTip],  indexTip.confidence  > 0.5 else { return false }
+        guard let middleTip = points[.middleTip], middleTip.confidence > 0.5 else { return false }
 
-        // Thumb must point clearly upward (Vision Y: 0=bottom, 1=top)
-        guard thumbTip.location.y > wrist.location.y + 0.12 else { return false }
+        // Both index and middle must be extended (far from wrist).
+        let idx_d = hypot(indexTip.location.x  - wrist.location.x,
+                          indexTip.location.y  - wrist.location.y)
+        let mid_d = hypot(middleTip.location.x - wrist.location.x,
+                          middleTip.location.y - wrist.location.y)
+        guard idx_d > 0.14, mid_d > 0.14 else { return false }
 
-        // Other fingertips must be folded (close to wrist)
-        let others: [VNHumanHandPoseObservation.JointName] = [.indexTip, .middleTip, .ringTip, .littleTip]
-        var folded = 0
-        for joint in others {
-            guard let tip = points[joint], tip.confidence > 0.5 else { folded += 1; continue }
-            let dx = tip.location.x - wrist.location.x
-            let dy = tip.location.y - wrist.location.y
-            if sqrt(dx * dx + dy * dy) < 0.15 { folded += 1 }
+        // Ring and little must be folded (close to wrist). Missing detection
+        // counts as folded — Vision sometimes drops these on partial occlusion.
+        let folded: [VNHumanHandPoseObservation.JointName] = [.ringTip, .littleTip]
+        var foldedCount = 0
+        for joint in folded {
+            guard let tip = points[joint], tip.confidence > 0.5 else { foldedCount += 1; continue }
+            let d = hypot(tip.location.x - wrist.location.x,
+                          tip.location.y - wrist.location.y)
+            if d < 0.14 { foldedCount += 1 }
         }
-        return folded >= 3
+        guard foldedCount >= 2 else { return false }
+
+        // Index and middle tips must be separated — rules out a single-finger point.
+        let tipSpread = hypot(indexTip.location.x - middleTip.location.x,
+                              indexTip.location.y - middleTip.location.y)
+        return tipSpread > 0.04
     }
 
     /// Returns the index fingertip position (Vision coords) when the hand is pointing

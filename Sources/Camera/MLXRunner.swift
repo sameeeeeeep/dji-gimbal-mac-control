@@ -40,32 +40,34 @@ def main():
         if not line:
             continue
         req_id = ""
-        tmp_path = None
+        tmp_paths = []
         try:
             req     = json.loads(line)
             req_id  = req.get("id", "")
             prompt  = req.get("prompt", "Describe in one sentence what is happening.")
             max_tok = int(req.get("max_tokens", 100))
-            img_b64 = req.get("image_b64")
 
-            # mlx_vlm 0.5 generate() expects file paths, not PIL objects
-            image_path = None
-            num_images = 0
-            if img_b64:
-                img_data = base64.b64decode(img_b64)
+            # Accept either a single `image_b64` (back-compat) or a list `images_b64`
+            # for multi-image turns (Gemma 4 supports interleaved multimodal input).
+            images_b64 = req.get("images_b64")
+            if not images_b64:
+                single = req.get("image_b64")
+                images_b64 = [single] if single else []
+
+            image_paths = []
+            for b64 in images_b64:
+                img_data = base64.b64decode(b64)
                 tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
                 tmp.write(img_data)
                 tmp.close()
-                tmp_path = tmp.name
-                image_path = tmp_path
-                num_images = 1
+                tmp_paths.append(tmp.name)
+                image_paths.append(tmp.name)
+            num_images = len(image_paths)
 
-            # Use messages list — works for Qwen2.5-VL and other chat VLMs
             messages = [{"role": "user", "content": prompt}]
             formatted = apply_chat_template(
                 processor, config, messages, num_images=num_images
             )
-            # apply_chat_template may return list or string depending on model
             if not isinstance(formatted, str):
                 tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
                 formatted = tok.apply_chat_template(
@@ -73,21 +75,27 @@ def main():
                     tokenize=False, add_generation_prompt=True
                 )
 
+            # mlx-vlm generate() accepts a single path or a list of paths.
+            gen_image = None
+            if num_images == 1:
+                gen_image = image_paths[0]
+            elif num_images > 1:
+                gen_image = image_paths
+
             result = generate(
                 model, processor,
                 prompt=formatted,
-                image=image_path,
+                image=gen_image,
                 max_tokens=max_tok,
                 verbose=False
             )
-            # GenerationResult in mlx_vlm >= 0.5 has a .text attribute
             response = result.text if hasattr(result, "text") else str(result)
             print(json.dumps({"id": req_id, "response": response}), flush=True)
         except Exception as e:
             print(json.dumps({"id": req_id, "error": str(e)}), flush=True)
         finally:
-            if tmp_path:
-                try: os.unlink(tmp_path)
+            for p in tmp_paths:
+                try: os.unlink(p)
                 except Exception: pass
 
 if __name__ == "__main__":
@@ -134,7 +142,9 @@ final class MLXRunner: ObservableObject {
     }
 
     @Published var state: State = .idle
-    @Published var modelTag = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+    // Gemma 4 E4B 4-bit MLX — native multimodal, 128k context, ~5GB RAM.
+    // Sweet spot for 8GB M1 Air; meaningful quality jump vs Qwen2-VL-2B.
+    @Published var modelTag = "mlx-community/gemma-4-e4b-it-4bit"
 
     private var process:     Process?
     private var stdinHandle: FileHandle?
@@ -214,6 +224,13 @@ final class MLXRunner: ObservableObject {
     /// Send a prompt (+ optional camera frame) to the VLM and await the response.
     /// Throws if the model is not ready or if inference fails.
     func query(_ prompt: String, image: CGImage? = nil, maxTokens: Int = 100) async throws -> String {
+        try await query(prompt, images: image.map { [$0] } ?? [], maxTokens: maxTokens)
+    }
+
+    /// Multi-image variant: the VLM sees all images in one turn (Gemma 4 handles
+    /// interleaved multimodal input). Order in the array is the order the model
+    /// sees them — refer to them as "Image 1", "Image 2", etc. in the prompt.
+    func query(_ prompt: String, images: [CGImage], maxTokens: Int = 100) async throws -> String {
         guard case .ready = state else { throw MLXError.notReady }
         let id = UUID().uuidString
         return try await withCheckedThrowingContinuation { [weak self] cont in
@@ -224,8 +241,11 @@ final class MLXRunner: ObservableObject {
             self.pending[id] = cont
             var body: [String: Any] = ["id": id, "prompt": prompt,
                                        "max_tokens": min(maxTokens, 200)]
-            if let cgImage = image, let b64 = Self.encodeJPEG(cgImage) {
-                body["image_b64"] = b64
+            let encoded = images.compactMap { Self.encodeJPEG($0) }
+            if encoded.count == 1 {
+                body["image_b64"] = encoded[0]
+            } else if encoded.count > 1 {
+                body["images_b64"] = encoded
             }
             guard let data = try? JSONSerialization.data(withJSONObject: body) else {
                 self.pending.removeValue(forKey: id)
@@ -236,10 +256,11 @@ final class MLXRunner: ObservableObject {
         }
     }
 
-    /// Encode a CGImage as a small JPEG for transport to the Python process.
-    /// Resizes to max 512px wide first — VLMs don't need full-res and it saves memory.
+    /// Encode a CGImage as a JPEG for transport to the Python process.
+    /// Resizes to max 768px wide first — Gemma 4's vision encoder works around
+    /// 768/896, and the temporal grid is already 640px so this preserves both.
     private static func encodeJPEG(_ image: CGImage) -> String? {
-        let maxW = 512
+        let maxW = 768
         let scale = min(1.0, Double(maxW) / Double(image.width))
         let w = max(1, Int(Double(image.width) * scale))
         let h = max(1, Int(Double(image.height) * scale))
