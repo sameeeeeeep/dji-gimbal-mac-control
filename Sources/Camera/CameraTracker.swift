@@ -62,6 +62,24 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var isFollowing = false
     @Published var detectedBbox: CGRect? // Vision coords: bottom-left origin, normalized [0,1]
     @Published var fps = 0
+    /// Name of the audio input attached to the capture session, or nil if none.
+    /// Surfaces in the UI / logs so silent recordings are immediately diagnosable.
+    @Published var audioInputName: String? = nil
+
+    /// All non-laptop microphones available right now (Continuity Camera +
+    /// external USB). The laptop's built-in mic is deliberately excluded —
+    /// this is a gimbal app, the phone is the canonical audio source.
+    @Published var availableMicrophones: [AVCaptureDevice] = []
+
+    /// User-selected microphone. Nil means "pick the first available
+    /// Continuity / external mic automatically". Never the laptop mic.
+    @Published var selectedMicrophone: AVCaptureDevice? {
+        didSet {
+            // Push the user's choice into the shared audio-routing helper so
+            // every AVAudioEngine (transcriber, VAD) picks it up on next start.
+            PreferredAudioInput.preferredDeviceUID = selectedMicrophone?.uniqueID
+        }
+    }
     @Published var trackingType: TrackingType = .face {
         didSet { bgTrackingType = trackingType }
     }
@@ -202,6 +220,7 @@ final class CameraTracker: NSObject, ObservableObject {
     let transcriber       = WhisperTranscriber()
     let journalAnalyzer   = JournalAnalyzer()
     let claudeAgent       = ClaudeAgent()
+    let identityStore     = IdentityStore()
     let faceRecognizer    = FaceRecognizer()
 
     nonisolated(unsafe) private var bgSpeakerFollowEnabled: Bool = false
@@ -340,6 +359,29 @@ final class CameraTracker: NSObject, ObservableObject {
         )
         availableCameras = session.devices
         selectedCamera = availableCameras.first
+        refreshMicrophones()
+    }
+
+    /// Enumerate every non-laptop mic the system can see right now. The
+    /// laptop's built-in mic is deliberately omitted from the deviceTypes
+    /// list so it can never be auto-selected — only Continuity Camera +
+    /// external (USB) inputs are surfaced. Call again whenever an iPhone
+    /// reconnects or the user plugs/unplugs a device.
+    func refreshMicrophones() {
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.continuityCamera, .external],
+            mediaType: .audio, position: .unspecified
+        )
+        availableMicrophones = session.devices
+        // Preserve the user's pick if it's still plugged in; otherwise reset
+        // to the first available so something is always selected when at
+        // least one non-laptop mic is connected.
+        if let cur = selectedMicrophone,
+           !availableMicrophones.contains(where: { $0.uniqueID == cur.uniqueID }) {
+            selectedMicrophone = availableMicrophones.first
+        } else if selectedMicrophone == nil {
+            selectedMicrophone = availableMicrophones.first
+        }
     }
 
     func startCamera() {
@@ -348,23 +390,10 @@ final class CameraTracker: NSObject, ObservableObject {
         guard let input = try? AVCaptureDeviceInput(device: camera) else { return }
         if session.canAddInput(input) { session.addInput(input) }
 
-        // Audio: prefer the mic on the same device as the selected camera
-        // (Continuity Camera exposes paired audio under the same localizedName).
-        let audioDiscovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.microphone, .external, .continuityCamera],
-            mediaType: .audio, position: .unspecified
-        )
-        let audioDevice = audioDiscovery.devices.first(where: { $0.localizedName == camera.localizedName })
-            ?? audioDiscovery.devices.first(where: { $0.deviceType == .continuityCamera })
-            ?? AVCaptureDevice.default(for: .audio)
-        if let mic = audioDevice,
-           let micInput = try? AVCaptureDeviceInput(device: mic),
-           session.canAddInput(micInput) {
-            session.addInput(micInput)
-            logger.info("Audio input: \(mic.localizedName)")
-        } else {
-            logger.warning("No audio input available — recordings will be silent")
-        }
+        // Audio attach: try now, but the Continuity Camera's paired audio
+        // device often only enumerates AFTER the video session starts, so we
+        // also retry post-startRunning below.
+        attachAudioInput(to: session, matching: camera)
 
         let videoOutput = AVCaptureVideoDataOutput()
         videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -387,6 +416,81 @@ final class CameraTracker: NSObject, ObservableObject {
         session.startRunning()
         isRunning = true
         logger.info("Camera started: \(camera.localizedName)")
+
+        // Retry audio attach a moment after the session is hot — gives the
+        // paired Continuity audio device time to enumerate.
+        if audioInputName == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, let session = self.captureSession,
+                      session.isRunning, self.audioInputName == nil else { return }
+                self.attachAudioInput(to: session, matching: camera)
+            }
+        }
+    }
+
+    /// Add a microphone input to the capture session. Called once during
+    /// `startCamera` and once again after the session is running, because the
+    /// Continuity Camera's paired audio device is sometimes not enumerated yet
+    /// at the first attempt. Idempotent — bails if the session already has audio.
+    ///
+    /// HARD RULE: never attaches the laptop's built-in mic. The candidate pool
+    /// is built from `.continuityCamera + .external` only. If nothing is
+    /// available, the recording is silent — that's the intended behavior, the
+    /// app is gimbal-/phone-centric.
+    private func attachAudioInput(to session: AVCaptureSession, matching camera: AVCaptureDevice) {
+        // Already attached? Don't add a second mic.
+        if session.inputs.contains(where: {
+            ($0 as? AVCaptureDeviceInput)?.device.hasMediaType(.audio) == true
+        }) { return }
+
+        // Re-enumerate at attach time — iPhone audio devices often appear
+        // a moment AFTER the capture session starts running.
+        refreshMicrophones()
+        let allowedMics = availableMicrophones  // Continuity + external only
+
+        // Priority order:
+        //   1. The user's explicit pick (selectedMicrophone), if still present
+        //   2. The mic paired by name with the active camera (Continuity)
+        //   3. Any other Continuity / external mic
+        let cam = camera.localizedName
+        let pairedMic = allowedMics.first(where: { mic in
+            let m = mic.localizedName
+            return m == cam ||
+                m.hasPrefix(cam) || cam.hasPrefix(m) ||
+                m.localizedCaseInsensitiveContains(cam) ||
+                cam.localizedCaseInsensitiveContains(m)
+        })
+
+        let candidates: [AVCaptureDevice] = [
+            selectedMicrophone.flatMap { sel in allowedMics.first(where: { $0.uniqueID == sel.uniqueID }) },
+            pairedMic,
+            allowedMics.first(where: { $0.deviceType == .continuityCamera }),
+            allowedMics.first(where: { $0.deviceType == .external })
+        ].compactMap { $0 }
+
+        for mic in candidates {
+            guard let micInput = try? AVCaptureDeviceInput(device: mic) else {
+                logger.warning("Audio attach: cannot create input for \(mic.localizedName, privacy: .public)")
+                continue
+            }
+            session.beginConfiguration()
+            if session.canAddInput(micInput) {
+                session.addInput(micInput)
+                session.commitConfiguration()
+                audioInputName = mic.localizedName
+                logger.info("Audio input attached: \(mic.localizedName, privacy: .public)")
+                return
+            }
+            session.commitConfiguration()
+            logger.warning("Audio attach: session refused \(mic.localizedName, privacy: .public)")
+        }
+
+        if allowedMics.isEmpty {
+            logger.warning("No non-laptop mic available — recording will be silent. Connect an iPhone via Continuity Camera or plug in a USB mic.")
+        } else {
+            let micList = allowedMics.map { $0.localizedName }.joined(separator: ", ")
+            logger.error("No audio input attached despite available mics: \(micList, privacy: .public)")
+        }
     }
 
     func stopCamera() {
@@ -402,6 +506,7 @@ final class CameraTracker: NSObject, ObservableObject {
         movieOutput = nil
         isRunning = false
         detectedBbox = nil
+        audioInputName = nil
     }
 
     // MARK: - Photo Capture
@@ -427,6 +532,20 @@ final class CameraTracker: NSObject, ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let url = dir.appendingPathComponent("gimbal_\(formatter.string(from: Date())).mov")
+        // Explicit audio output settings — without this, AVCaptureMovieFileOutput
+        // tries to autodetect a compressor config from the input format and
+        // sometimes fails ("Setting properties failed for file format compressor
+        // node, err=-67444"), which silently drops the audio track. AAC at
+        // 44.1kHz mono matches what Continuity / built-in mics produce.
+        if let audioConn = output.connection(with: .audio) {
+            let settings: [String: Any] = [
+                AVFormatIDKey:           kAudioFormatMPEG4AAC,
+                AVSampleRateKey:         44_100,
+                AVNumberOfChannelsKey:   1,
+                AVEncoderBitRateKey:     64_000
+            ]
+            output.setOutputSettings(settings, for: audioConn)
+        }
         output.startRecording(to: url, recordingDelegate: self)
         isRecording = true
         recordingDuration = 0
@@ -755,6 +874,12 @@ final class CameraTracker: NSObject, ObservableObject {
     /// the manual pan doesn't fight the follow loop, and any existing lock is
     /// cleared.
     func aimAt(normalizedPoint p: CGPoint) {
+        // Lock is exclusive: while locked, click-to-aim is inert. The gimbal
+        // stays on the locked subject until the on-screen lock button releases.
+        if followLocked {
+            logger.info("AIM: ignored (followLocked)")
+            return
+        }
         // Convert preview offset → angle delta. Camera horizontal FOV is ~65°
         // for the iPhone Continuity Camera; vertical scales by the 16:9 aspect.
         let dx = p.x - 0.5
@@ -852,6 +977,13 @@ final class CameraTracker: NSObject, ObservableObject {
         if abs(dyaw) < navArrivalDeg && abs(dpitch) < navArrivalDeg {
             onSpeedCommand?(0, 0)
             stopNavigation()
+            // The locked subject is now near frame center after the pan.
+            // Re-anchor the follow lock to (0.5, 0.5) so the follow loop
+            // tracks the centered subject instead of chasing whatever is
+            // closest to the original off-center click coordinate.
+            if lockedTargetPoint != nil {
+                lockedTargetPoint = CGPoint(x: 0.5, y: 0.5)
+            }
             logger.info("NAV: arrived")
             return
         }
@@ -861,7 +993,10 @@ final class CameraTracker: NSObject, ObservableObject {
         onSpeedCommand?(yawSpeed, pitchSpeed)
     }
 
-    private func stopNavigation() {
+    /// Cancel any in-progress click-to-aim / point-and-go navigation. Public so
+    /// manual + AI control paths can assert exclusive access before issuing
+    /// their own absolute rotate commands.
+    func stopNavigation() {
         navTimer?.invalidate()
         navTimer = nil
         navTarget = nil
@@ -1635,15 +1770,17 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             return
         }
 
-        // ── Peace sign (index + middle): lock/unlock ──────────────────────────
+        // ── Peace sign (index + middle): LOCK only (never unlock) ─────────────
+        // Once locked, only the on-screen lock button can release it. This
+        // prevents accidental unlocks from a stray gesture.
         if isPeaceSign(obs) {
             bgPeaceFrameCount = min(bgPeaceFrameCount + 1, peaceConfirmFrames + 1)
             bgPalmFrameCount     = 0
             bgPointingFrameCount = 0
             if bgPeaceFrameCount == peaceConfirmFrames {
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.followLocked.toggle()
+                    guard let self, !self.followLocked else { return }
+                    self.followLocked = true
                     self.palmGestureActive    = false
                     self.pointingGestureActive = false
                     self.palmGuideBbox        = nil
@@ -1685,8 +1822,8 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                     self?.palmGuideBbox    = nil
                     self?.palmGestureActive = false
-                    // Open palm after lock = unlock
-                    self?.followLocked     = false
+                    // Open palm no longer touches followLocked — only the
+                    // on-screen lock button can release a lock.
                 }
             }
             return
@@ -1702,10 +1839,12 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         Task { @MainActor [weak self] in
             guard let self, self.isRunning else { return }
+            // If already locked, palm gestures are inert — the lock owns the
+            // gimbal until the on-screen lock button releases it.
+            guard !self.followLocked else { return }
             self.palmGuideBbox        = synthBbox
             self.palmGestureActive    = true
             self.pointingGestureActive = false
-            self.followLocked         = false
             if !self.isFollowing { self.startFollow() }
         }
     }
@@ -1733,6 +1872,12 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     @MainActor
     func startPointSeek(dx: CGFloat, dy: CGFloat) {
         guard isRunning, pointSeekPhase == .idle else { return }
+        // Lock is exclusive — pointing gestures cannot move the gimbal until
+        // the on-screen lock button releases the lock.
+        guard !followLocked else {
+            logger.info("POINT-SEEK: ignored (followLocked)")
+            return
+        }
 
         // Need a meaningful direction — ignore tiny vectors (false positives).
         let mag = sqrt(dx * dx + dy * dy)

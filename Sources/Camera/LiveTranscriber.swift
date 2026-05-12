@@ -105,7 +105,13 @@ final class LiveTranscriber: ObservableObject {
         req.shouldReportPartialResults = true
         req.taskHint = .dictation
 
+        guard PreferredAudioInput.hasNonLaptopMic else {
+            logger.warning("LiveTranscriber: no non-laptop mic — not starting")
+            isTranscribing = false
+            return
+        }
         let eng = AVAudioEngine()
+        PreferredAudioInput.apply(to: eng)
         let inputNode = eng.inputNode
         let fmt = inputNode.outputFormat(forBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in

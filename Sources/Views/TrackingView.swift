@@ -792,9 +792,20 @@ private struct FollowButton: View {
                 }
                 Spacer()
                 if tracker.isFollowing {
-                    Image(systemName: tracker.followLocked ? "lock.fill" : "lock.open")
-                        .font(.system(size: 11))
-                        .foregroundColor(tracker.followLocked ? DS.yellow : .black.opacity(0.3))
+                    // Tappable lock toggle. This is the ONLY way to unlock
+                    // once a peace-sign gesture or AI tool has locked follow —
+                    // palm gestures intentionally cannot release the lock.
+                    Button {
+                        tracker.followLocked.toggle()
+                    } label: {
+                        Image(systemName: tracker.followLocked ? "lock.fill" : "lock.open")
+                            .font(.system(size: 13))
+                            .foregroundColor(tracker.followLocked ? DS.yellow : .black.opacity(0.45))
+                            .padding(6)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(tracker.followLocked ? "Unlock follow" : "Lock follow")
                 }
             }
             .foregroundColor(tracker.isFollowing ? .black : DS.cyan)
@@ -1752,6 +1763,46 @@ private struct SettingsPopover: View {
                 .disabled(tracker.isRunning)
                 .font(.system(size: 12))
                 .frame(maxWidth: .infinity)
+            }
+
+            // ── Microphone selection (never the laptop mic) ───────
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("MICROPHONE")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .tracking(2)
+                        .foregroundColor(.white.opacity(0.45))
+                    Spacer()
+                    Button {
+                        tracker.refreshMicrophones()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.55))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Re-scan for mics")
+                }
+                if tracker.availableMicrophones.isEmpty {
+                    Text("No iPhone or external mic detected.\nLaptop mic is intentionally excluded.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.orange.opacity(0.85))
+                        .lineLimit(2)
+                } else {
+                    Picker("", selection: $tracker.selectedMicrophone) {
+                        ForEach(tracker.availableMicrophones, id: \.uniqueID) { mic in
+                            Text(mic.localizedName).tag(mic as AVCaptureDevice?)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(.system(size: 12))
+                    .frame(maxWidth: .infinity)
+                }
+                if let inUse = tracker.audioInputName {
+                    Text("Live: \(inUse)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.4))
+                }
             }
 
             // ── Live transcription ───────────────────────────────

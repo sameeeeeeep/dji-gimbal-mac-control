@@ -67,6 +67,63 @@ final class GimbalService: ObservableObject {
         if ProcessInfo.processInfo.environment["GIMBAL_SIMULATOR"] == "1" {
             DispatchQueue.main.async { [weak self] in self?.enableSimulator() }
         }
+
+        // ── Auto-start: pick iPhone camera + scan for OM-series gimbal ─────
+        // Watch the discovered-device list and connect to the first OM gimbal
+        // that appears. The BLE manager waits for CoreBluetooth to be powered
+        // on internally, so we can safely kick off the scan immediately.
+        connectionManager.$discoveredDevices
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] devices in
+                guard let self, !self.didAutoConnect, !self.isSimulator else { return }
+                if case .ready = self.state.connectionState { return }
+                let match = devices.first(where: { dev in
+                    let n = dev.name.lowercased()
+                    // OM 6 / OM6 / Osmo Mobile 6 — match any DJI OM-series.
+                    return n.contains("om 6") || n.contains("om6")
+                        || n.contains("osmo mobile 6")
+                        || n.contains("osmo mobile")
+                        || n.contains("om ")
+                })
+                guard let match else { return }
+                self.didAutoConnect = true
+                logger.info("Auto-connecting to \(match.name)")
+                self.connect(to: match)
+            }
+            .store(in: &cancellables)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.startAutoSession()
+        }
+    }
+
+    /// True after we kick off an auto-connect attempt this session, so we
+    /// don't repeatedly call connect() as the discovery list updates.
+    private var didAutoConnect = false
+
+    /// On launch: pick the iPhone (Continuity Camera) as the active camera and
+    /// start it, then kick off BLE scan so the OM gimbal can be discovered.
+    private func startAutoSession() {
+        // Camera: prefer a Continuity Camera (iPhone). Fall back to first.
+        let cameras = cameraTracker.availableCameras
+        let preferred = cameras.first(where: { $0.deviceType == .continuityCamera })
+            ?? cameras.first(where: { $0.localizedName.localizedCaseInsensitiveContains("iphone") })
+            ?? cameras.first
+        if let cam = preferred {
+            cameraTracker.selectedCamera = cam
+            if !cameraTracker.isRunning {
+                cameraTracker.startCamera()
+                logger.info("Auto-started camera: \(cam.localizedName)")
+            }
+        } else {
+            logger.warning("Auto-start: no camera available")
+        }
+
+        // BLE: start scanning. The Combine sink above will auto-connect when
+        // a matching gimbal name shows up in the discovery list.
+        if !isSimulator, case .disconnected = state.connectionState {
+            startScan()
+        }
     }
 
     // MARK: - Connection
@@ -122,6 +179,11 @@ final class GimbalService: ObservableObject {
     }
 
     func recenter() {
+        // Assert exclusive control: kill any active follow loop or click-to-aim
+        // navigation so they don't immediately overwrite this command with speed
+        // packets on their next tick.
+        cameraTracker.stopFollow()
+        cameraTracker.stopNavigation()
         if isSimulator {
             startSimAnimation(to: GimbalPosition(yaw: 0, pitch: 0, roll: 0), durationSec: 0.5)
             return
@@ -132,6 +194,12 @@ final class GimbalService: ObservableObject {
 
     /// Move gimbal to an absolute angle position.
     func absoluteRotate(yaw: Double, pitch: Double, time: UInt8 = 20) {
+        // Assert exclusive control. Without this, the camera tracker's follow
+        // and navigation loops keep ticking ~10–60 Hz speed commands that
+        // immediately drag the gimbal back, making manual buttons and AI
+        // tool calls appear broken.
+        cameraTracker.stopFollow()
+        cameraTracker.stopNavigation()
         if isSimulator {
             // `time` is in 10ms units; clamp the visible animation to ≥150ms
             let dur = max(0.15, TimeInterval(time) * 0.01)

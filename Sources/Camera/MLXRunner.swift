@@ -142,9 +142,11 @@ final class MLXRunner: ObservableObject {
     }
 
     @Published var state: State = .idle
-    // Gemma 4 E4B 4-bit MLX — native multimodal, 128k context, ~5GB RAM.
-    // Sweet spot for 8GB M1 Air; meaningful quality jump vs Qwen2-VL-2B.
-    @Published var modelTag = "mlx-community/gemma-4-e4b-it-4bit"
+    // Gemma 3 4B Instruct 4-bit MLX — ~2.5GB. Sweet spot between Qwen2-VL-2B
+    // (too dumb) and Gemma 4 E4B (~5GB, OOMs the Metal command buffer on 8GB
+    // Macs). Properly multimodal, follows the "third-person factual" prompt
+    // contract much more reliably than the 2B class.
+    @Published var modelTag = "mlx-community/gemma-3-4b-it-4bit"
 
     private var process:     Process?
     private var stdinHandle: FileHandle?
@@ -152,6 +154,14 @@ final class MLXRunner: ObservableObject {
     /// In-flight requests keyed by UUID string.
     private var pending: [String: CheckedContinuation<String, Error>] = [:]
     private let logger = Logger(subsystem: "com.gimbal.controller", category: "MLX")
+
+    /// Auto-restart bookkeeping: if the python process dies (e.g. Metal OOM),
+    /// we kick off a new one rather than leaving the runner permanently in
+    /// .error state. Counts unexpected exits in a sliding window so a wedged
+    /// install doesn't loop forever.
+    private var recentCrashes: [Date] = []
+    private let crashWindow: TimeInterval = 120
+    private let maxCrashesInWindow: Int = 3
 
     var isReady: Bool { state == .ready }
 
@@ -177,10 +187,32 @@ final class MLXRunner: ObservableObject {
 
         let stdinPipe  = Pipe()
         let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()   // silence stderr
+        let stderrPipe = Pipe()
         proc.standardInput  = stdinPipe
         proc.standardOutput = stdoutPipe
         proc.standardError  = stderrPipe
+
+        // CRITICAL: stderr MUST be drained. Without a reader, the OS pipe
+        // buffer (~64KB) fills, the python process blocks on its next write,
+        // and all inference freezes — the model loads, then queries time out
+        // with no obvious cause. Pipe stderr lines into our logger so we can
+        // see actual MLX errors instead of silent hangs.
+        let stderrLogger = self.logger
+        var stderrBuf = Data()
+        stderrPipe.fileHandleForReading.readabilityHandler = { fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty { fh.readabilityHandler = nil; return }
+            stderrBuf.append(chunk)
+            while let nl = stderrBuf.firstIndex(of: 0x0A) {
+                let lineData = stderrBuf.subdata(in: stderrBuf.startIndex..<nl)
+                stderrBuf.removeSubrange(stderrBuf.startIndex...nl)
+                if let line = String(data: lineData, encoding: .utf8)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !line.isEmpty {
+                    stderrLogger.info("MLX stderr: \(line, privacy: .public)")
+                }
+            }
+        }
 
         proc.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
@@ -188,7 +220,32 @@ final class MLXRunner: ObservableObject {
                 self.failAllPending(with: .processError("Process exited unexpectedly"))
                 self.process     = nil
                 self.stdinHandle = nil
-                if case .ready = self.state { self.state = .error("Process exited") }
+
+                // Auto-restart on unexpected exit (most commonly Metal OOM
+                // from a too-large image payload). Without this, a single
+                // crash leaves the journal pipeline silently dead until the
+                // user quits and relaunches the whole app.
+                let wasReady = (self.state == .ready)
+                let now = Date()
+                self.recentCrashes.append(now)
+                self.recentCrashes.removeAll { now.timeIntervalSince($0) > self.crashWindow }
+
+                if self.recentCrashes.count > self.maxCrashesInWindow {
+                    self.logger.error("MLX crashed \(self.recentCrashes.count) times in \(Int(self.crashWindow))s — giving up auto-restart")
+                    self.state = .error("MLX repeatedly crashing — check logs")
+                    return
+                }
+                if wasReady {
+                    self.logger.warning("MLX exited unexpectedly — restarting (attempt \(self.recentCrashes.count))")
+                    self.state = .idle
+                    // Small delay so the previous Process object fully drains
+                    // its pipes before we reuse the readabilityHandlers.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        self?.start()
+                    }
+                } else {
+                    self.state = .error("Process exited")
+                }
             }
         }
 
@@ -257,10 +314,11 @@ final class MLXRunner: ObservableObject {
     }
 
     /// Encode a CGImage as a JPEG for transport to the Python process.
-    /// Resizes to max 768px wide first — Gemma 4's vision encoder works around
-    /// 768/896, and the temporal grid is already 640px so this preserves both.
+    /// Capped at 512px wide — on 8GB Macs Gemma 4's vision encoder OOMs the
+    /// Metal command buffer with larger inputs. The encoder downsamples to
+    /// its own patch grid internally, so bigger source images gain no quality.
     private static func encodeJPEG(_ image: CGImage) -> String? {
-        let maxW = 768
+        let maxW = 512
         let scale = min(1.0, Double(maxW) / Double(image.width))
         let w = max(1, Int(Double(image.width) * scale))
         let h = max(1, Int(Double(image.height) * scale))

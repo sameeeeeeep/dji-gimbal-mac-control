@@ -40,7 +40,12 @@ final class SpeakerFollowManager: ObservableObject {
 
     func start() {
         guard audioEngine == nil else { return }
+        guard PreferredAudioInput.hasNonLaptopMic else {
+            logger.warning("SpeakerFollow: no non-laptop mic — VAD not starting")
+            return
+        }
         let engine = AVAudioEngine()
+        PreferredAudioInput.apply(to: engine)
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
 

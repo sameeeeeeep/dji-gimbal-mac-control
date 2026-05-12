@@ -352,9 +352,23 @@ final class ClaudeAgent: ObservableObject {
         rawDescriptions: [(text: String, secondsAgo: Int)],
         visionFacts:     String,
         recentTranscript: String?,
-        recentBeats:     [(mode: ObservationMode, sentence: String)]
+        recentBeats:     [(mode: ObservationMode, sentence: String)],
+        gridImage:       CGImage? = nil,
+        identityContext: String? = nil
     ) async -> (mode: ObservationMode, sentence: String)? {
         guard let binary = binaryPath else { return nil }
+
+        // If we have a temporal grid, write it to a tempfile so the CLI can
+        // attach it to the prompt via @<path>. Claude sees the image directly
+        // and combines it with the dumb-eye descriptions for richer beats.
+        var imagePath: URL?
+        if let grid = gridImage,
+           let url = Self.writeTempJPEG(grid) {
+            imagePath = url
+        }
+        defer {
+            if let p = imagePath { try? FileManager.default.removeItem(at: p) }
+        }
 
         // Build the synthesis user prompt
         let descLines = rawDescriptions.suffix(5).map { item in
@@ -369,12 +383,32 @@ final class ClaudeAgent: ObservableObject {
             ? "Recent speech: \"\(recentTranscript!)\"\n"
             : ""
 
+        let imageBlock: String
+        if let imagePath {
+            imageBlock = """
+            You are watching a director's monitor for someone being filmed. You CAN see the camera feed: the attached image is a temporal sprite-sheet of recent frames (top-left = oldest, bottom-right = newest). Use what you see directly. The dumb-eye descriptions below are extra context only.
+
+            @\(imagePath.path)
+
+            Dumb-eye descriptions of the same frames:
+            \(descLines)
+            """
+        } else {
+            imageBlock = """
+            You are watching a director's monitor for someone being filmed. You can't see the image — you only have these raw visual descriptions from a small vision model that just looked at recent frames:
+
+            \(descLines)
+            """
+        }
+
+        let identityLine: String = (identityContext?.isEmpty == false)
+            ? "Identity: \(identityContext!)\n"
+            : ""
+
         let synthUser = """
-        You are watching a director's monitor for someone being filmed. You can't see the image — you only have these raw visual descriptions from a small vision model that just looked at recent frames:
+        \(imageBlock)
 
-        \(descLines)
-
-        \(visionFacts.isEmpty ? "" : "Apple Vision facts: \(visionFacts)\n")\(speechLine)\(beatLines.isEmpty ? "" : "Your previous beats (do NOT repeat these — say something different):\n\(beatLines)\n")
+        \(visionFacts.isEmpty ? "" : "Apple Vision facts: \(visionFacts)\n")\(identityLine)\(speechLine)\(beatLines.isEmpty ? "" : "Your previous beats (do NOT repeat these — say something different):\n\(beatLines)\n")
         Write ONE OBSERVATIONAL sentence. Strict rules:
           • It must DESCRIBE what's concretely visible — the room, the person, what they're doing, what just changed.
           • NO advice. NO coaching. NO aphorisms or prescriptions. NO "you should" / "let X settle Y".
@@ -469,6 +503,23 @@ final class ClaudeAgent: ObservableObject {
             do { try proc.run() } catch {
                 if !resumed { resumed = true; cont.resume(throwing: error) }
             }
+        }
+    }
+
+    /// Write a CGImage to a unique temp JPEG so it can be attached to a
+    /// Claude CLI call via @<path>. Caller is responsible for unlinking.
+    private static func writeTempJPEG(_ image: CGImage) -> URL? {
+        let dir = FileManager.default.temporaryDirectory
+        let url = dir.appendingPathComponent("gimbal-beat-\(UUID().uuidString).jpg")
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let data = rep.representation(using: .jpeg,
+                                            properties: [.compressionFactor: 0.85])
+        else { return nil }
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            return nil
         }
     }
 

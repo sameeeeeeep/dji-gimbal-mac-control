@@ -87,8 +87,8 @@ final class JournalAnalyzer: ObservableObject {
     /// (Currently we serialize so this stays at 0; reserved for future parallelism.)
     @Published var queuedCount: Int = 0
 
-    var frameInterval: TimeInterval = 3.0
-    var writeCooldown: TimeInterval = 20.0
+    var frameInterval: TimeInterval = 4.0
+    var writeCooldown: TimeInterval = 45.0
 
     private weak var tracker:    CameraTracker?
     private weak var transcriber: WhisperTranscriber?
@@ -96,6 +96,7 @@ final class JournalAnalyzer: ObservableObject {
 
     private let visionQueue = DispatchQueue(label: "com.gimbal.vision", qos: .utility)
     private var visionBusy  = false
+    private let embeddingGate = EmbeddingGate()
 
     // Change detection state
     private var prevFaceCount     = -1
@@ -105,7 +106,7 @@ final class JournalAnalyzer: ObservableObject {
     private var lastWriteTime     = Date.distantPast
     private var heartbeatTimer:   Timer?
     private var lastHeartbeat     = Date.distantPast
-    private let heartbeatInterval: TimeInterval = 60.0
+    private let heartbeatInterval: TimeInterval = 180.0
     private var lastBeatOneLiner  = ""
     /// Last 3 beat sentences for similarity deduplication AND for cross-beat context.
     private var recentBeatSentences: [String] = []
@@ -116,11 +117,13 @@ final class JournalAnalyzer: ObservableObject {
     /// last few of these when synthesizing a polished beat.
     private var rawObservations: [(text: String, ts: Date)] = []
     private let rawObsCapacity = 8
-    /// Ring buffer of the last 4 captured frames (oldest first). Composited into a
-    /// 2×2 temporal grid before being sent to the VLM so it can see motion + change
-    /// instead of receiving isolated snapshots.
+    /// Ring buffer of the last 16 captured frames (oldest first). Composited into a
+    /// 4×4 temporal sprite sheet before being sent to the VLM so one inference call
+    /// covers ~60s of context instead of ~12s — lets us throttle Gemma harder.
     private var frameBuffer: [(image: CGImage, timestamp: Date)] = []
-    private let frameBufferCapacity = 4
+    private let frameBufferCapacity = 16
+    private let gridCols = 4
+    private let gridRows = 4
 
     private var sessionStart = Date()
     private let logger = Logger(subsystem: "com.gimbal.controller", category: "JournalAnalyzer")
@@ -171,6 +174,16 @@ final class JournalAnalyzer: ObservableObject {
     private func captureAndObserve() {
         guard let tracker, let image = tracker.captureCurrentFrame() else { return }
         guard !visionBusy else { return }
+
+        // Scene-change gate: skip frames that look identical to the last fired
+        // frame. This is cheap (single feature print) and lets us throttle the
+        // VLM hard when nothing's happening.
+        let gate = embeddingGate.shouldFire(image)
+        if !gate.fire {
+            logger.debug("gate: skip frame (dist \(gate.distance, privacy: .public))")
+            return
+        }
+
         visionBusy = true
 
         // Push into the temporal ring buffer (used to build the 2×2 grid for VLM)
@@ -276,17 +289,23 @@ final class JournalAnalyzer: ObservableObject {
         modelStatus = "Looking…"
 
         // Build the temporal 2×2 composite from the ring buffer + a full-res
-        // latest frame. The model sees both: grid for change-over-time, full-res
-        // for fine details (faces, screens, hands).
+        // latest frame. We deliberately send ONLY ONE image to the VLM:
+        // sending two (grid + full-res) blew out Metal's command buffer and
+        // crashed the python process with kIOGPUCommandBufferCallbackErrorOutOfMemory.
+        // The bottom-right cell of the grid IS the newest frame, so the grid
+        // alone carries both temporal context and "what's happening now".
         let bufferSnapshot = frameBuffer
-        let composite = Self.composeTemporalGrid(buffer: bufferSnapshot)
+        let composite = Self.composeTemporalGrid(buffer: bufferSnapshot, cols: gridCols, rows: gridRows)
         let latestFrame = bufferSnapshot.last?.image ?? tracker?.captureCurrentFrame()
         if let composite { Self.writeDebugComposite(composite) }
-        // Build the image array sent to the VLM. When we only have one frame
-        // (no history yet), skip the grid and send just the latest.
         var vlmImages: [CGImage] = []
-        if let composite, bufferSnapshot.count >= 2 { vlmImages.append(composite) }
-        if let latestFrame { vlmImages.append(latestFrame) }
+        if let composite, bufferSnapshot.count >= 2 {
+            vlmImages.append(composite)
+        } else if let latestFrame {
+            // First few frames before the grid is populated — send the single
+            // full-res frame so we get a beat right away.
+            vlmImages.append(latestFrame)
+        }
 
         let oneLiner = obs.oneLiner
         let recentSpeech = transcriber.flatMap { t -> String? in
@@ -297,7 +316,7 @@ final class JournalAnalyzer: ObservableObject {
         let spanSec: Int = bufferSnapshot.count >= 2
             ? max(1, Int(bufferSnapshot.last!.timestamp.timeIntervalSince(bufferSnapshot.first!.timestamp)))
             : 0
-        let vlmPrompt = buildVLMDescriptionPrompt(frameCount: frameCount, spanSec: spanSec)
+        let vlmPrompt = buildVLMDescriptionPrompt(frameCount: frameCount, spanSec: spanSec, cols: gridCols, rows: gridRows)
 
         // Snapshot needed context before going off-actor
         let beatsForContext = recentBeats
@@ -305,6 +324,17 @@ final class JournalAnalyzer: ObservableObject {
         let claudeAgent    = tracker?.claudeAgent
         let useClaudeSynth = claudeAgent?.isConfigured == true
         let rawObsSnapshot = rawObservations
+
+        // Identity context — embed the latest frame against known places, and
+        // crop+embed each detected face against known people. Done on MainActor
+        // before going off-actor so the store is touched safely.
+        let identityFacts: String = {
+            guard let tracker, let frame = latestFrame else { return "" }
+            return Self.buildIdentityFacts(frame: frame,
+                                           subjects: obs.subjects,
+                                           store: tracker.identityStore,
+                                           gate: embeddingGate)
+        }()
 
         // Publish in-flight grid for the pipeline strip BEFORE going off-actor.
         let inflightGridForUI = composite
@@ -355,7 +385,9 @@ final class JournalAnalyzer: ObservableObject {
                         rawDescriptions: history,
                         visionFacts:     visionFacts,
                         recentTranscript: recentSpeech,
-                        recentBeats:     beatsForContext
+                        recentBeats:     beatsForContext,
+                        gridImage:       inflightGridForUI,
+                        identityContext: identityFacts.isEmpty ? nil : identityFacts
                     )
                     if let s = synth {
                         finalMode     = s.mode
@@ -401,10 +433,63 @@ final class JournalAnalyzer: ObservableObject {
                     self?.modelStatus = "Running"
                     self?.inflightGrid      = nil
                     self?.inflightStartedAt = nil
-                    self?.logger.error("Beat pipeline failed: \(error.localizedDescription)")
+                    self?.logger.error("Beat pipeline failed: \(error.localizedDescription, privacy: .public)")
                 }
             }
         }
+    }
+
+    /// Embeds the full frame against known places and each face crop against
+    /// known people, returning a single line for the Claude synth prompt.
+    /// Format: "seen: Sameep (0.05), unknown · place: desk (0.10)".
+    /// Empty string when nothing matches and there are no faces to report.
+    @MainActor
+    static func buildIdentityFacts(frame: CGImage,
+                                   subjects: [DetectedSubject],
+                                   store: IdentityStore,
+                                   gate: EmbeddingGate) -> String {
+        var parts: [String] = []
+
+        // People — embed each face crop and look it up.
+        var peopleTokens: [String] = []
+        for subj in subjects.prefix(4) {
+            guard let crop = cropImage(frame, normalisedBbox: subj.bbox) else { continue }
+            guard let obs = gate.embed(crop) else { continue }
+            if let (hit, dist) = store.matchFace(obs) {
+                let name = hit.name ?? "person"
+                peopleTokens.append(String(format: "%@ (%.2f)", name, dist))
+            } else {
+                peopleTokens.append("unknown")
+            }
+        }
+        if !peopleTokens.isEmpty {
+            parts.append("seen: " + peopleTokens.joined(separator: ", "))
+        }
+
+        // Place — embed full frame.
+        if let obs = gate.embed(frame),
+           let (hit, dist) = store.matchPlace(obs) {
+            let name = hit.name ?? "place"
+            parts.append(String(format: "place: %@ (%.2f)", name, dist))
+        }
+
+        return parts.joined(separator: " · ")
+    }
+
+    /// Vision bboxes are bottom-left origin, normalised [0,1]. CGImage.cropping
+    /// uses a pixel rect in image-internal (top-left origin) coords. Convert.
+    nonisolated static func cropImage(_ image: CGImage, normalisedBbox bbox: CGRect) -> CGImage? {
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        let pxX = bbox.origin.x * w
+        let pxW = bbox.width * w
+        let pxH = bbox.height * h
+        // Flip y: Vision y=0 at bottom; CGImage cropping y=0 at top.
+        let pxY = (1.0 - bbox.origin.y - bbox.height) * h
+        let rect = CGRect(x: pxX, y: pxY, width: pxW, height: pxH).integral
+        guard rect.width > 4, rect.height > 4,
+              rect.minX >= 0, rect.minY >= 0,
+              rect.maxX <= w, rect.maxY <= h else { return nil }
+        return image.cropping(to: rect)
     }
 
     /// Builds a compact comma-separated string of Apple Vision-derived scene facts
@@ -442,7 +527,7 @@ final class JournalAnalyzer: ObservableObject {
     /// cinematographer or media coach — small models parrot keywords. We ask for
     /// a plain CONCRETE description: room, person, posture, action. Claude then
     /// synthesizes the polished beat downstream.
-    private func buildVLMDescriptionPrompt(frameCount: Int, spanSec: Int) -> String {
+    private func buildVLMDescriptionPrompt(frameCount: Int, spanSec: Int, cols: Int, rows: Int) -> String {
         // The small VLM's failure mode is filler ("pale walls, soft lighting,
         // a serene atmosphere"). We force it onto specifics: who is present,
         // what their hands/gaze are doing, what objects they're touching or
@@ -467,7 +552,7 @@ final class JournalAnalyzer: ObservableObject {
         Bad:  "A peaceful workspace with soft natural light and a sense of calm focus."
         """
         if frameCount >= 2 {
-            return base + "\n\nYou are receiving two images of the same scene:\n  • Image 1: a 2×2 grid of \(frameCount) frames in chronological order (top-left = oldest, bottom-right = newest, span ≈ \(spanSec)s).\n  • Image 2: the newest frame at full resolution — use this for fine details (faces, screens, objects).\n\nDescribe what is happening in the newest frame. If a hand/gaze/object position changed across the grid, append a short clause (4–6 words) naming the change."
+            return base + "\n\nThe image you are seeing is a \(cols)×\(rows) sprite sheet of \(frameCount) frames of the same scene in chronological order (top-left = oldest, bottom-right = newest, span ≈ \(spanSec)s). Focus your description on the bottom-right cell — that is what is happening RIGHT NOW. If a hand/gaze/object position changed across the sheet, append a short clause (4–6 words) naming the change."
         }
         return base
     }
@@ -480,13 +565,20 @@ final class JournalAnalyzer: ObservableObject {
     /// content rather than overlaying borders or diff highlights, which add
     /// pixel noise and bias small VLMs toward describing the markings.
     nonisolated static func composeTemporalGrid(
-        buffer: [(image: CGImage, timestamp: Date)]
+        buffer: [(image: CGImage, timestamp: Date)],
+        cols: Int = 2,
+        rows: Int = 2
     ) -> CGImage? {
-        guard !buffer.isEmpty else { return nil }
+        guard !buffer.isEmpty, cols > 0, rows > 0 else { return nil }
 
-        // 2×2 grid of 320×180 cells → 640×360 total (fits well within VLM input limits)
-        let cellW = 320, cellH = 180
-        let gridW = cellW * 2, gridH = cellH * 2
+        // Cap the composite around 448px wide — larger composites blow out
+        // Gemma 4's vision-encoder peak memory on 8GB Macs (kIOGPUCommand-
+        // BufferCallbackErrorOutOfMemory). The encoder downsamples to its
+        // patch grid anyway, so feeding it more pixels gains nothing.
+        let cellW = max(96, 448 / cols)
+        let cellH = cellW * 9 / 16
+        let gridW = cellW * cols, gridH = cellH * rows
+        let capacity = cols * rows
 
         guard let ctx = CGContext(
             data: nil,
@@ -496,41 +588,38 @@ final class JournalAnalyzer: ObservableObject {
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
         ) else { return nil }
 
-        // Dark background for empty cells
         ctx.setFillColor(CGColor(red: 0.04, green: 0.04, blue: 0.04, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: gridW, height: gridH))
         ctx.interpolationQuality = .medium
 
-        // CGContext y is bottom-up. Visually: top-left = oldest, bottom-right = newest.
-        //   index 0 → top-left     (x=0,     y=cellH)
-        //   index 1 → top-right    (x=cellW, y=cellH)
-        //   index 2 → bottom-left  (x=0,     y=0)
-        //   index 3 → bottom-right (x=cellW, y=0)
-        let cellOrigins: [CGPoint] = [
-            CGPoint(x: 0,     y: cellH),
-            CGPoint(x: cellW, y: cellH),
-            CGPoint(x: 0,     y: 0),
-            CGPoint(x: cellW, y: 0)
-        ]
-
+        // CGContext y is bottom-up. We want chronological order top-left → bottom-right,
+        // so index i maps to row (i / cols) from the top, col (i % cols) from the left.
         for (i, item) in buffer.enumerated() {
-            guard i < 4 else { break }
-            let origin = cellOrigins[i]
-            let cellRect = CGRect(x: origin.x, y: origin.y, width: CGFloat(cellW), height: CGFloat(cellH))
-
+            guard i < capacity else { break }
+            let row = i / cols       // 0 = top
+            let col = i % cols       // 0 = left
+            let x = col * cellW
+            let y = (rows - 1 - row) * cellH  // flip for bottom-up coords
+            let cellRect = CGRect(x: x, y: y, width: cellW, height: cellH)
             ctx.saveGState()
             ctx.clip(to: cellRect)
             ctx.draw(item.image, in: cellRect)
             ctx.restoreGState()
         }
 
-        // Thin neutral divider lines so adjacent cells don't blur into each other.
+        // Thin neutral dividers so adjacent cells don't blur into each other.
         ctx.setStrokeColor(CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 0.4))
         ctx.setLineWidth(1)
-        ctx.move(to:    CGPoint(x: cellW,        y: 0))
-        ctx.addLine(to: CGPoint(x: cellW,        y: gridH))
-        ctx.move(to:    CGPoint(x: 0,            y: cellH))
-        ctx.addLine(to: CGPoint(x: gridW,        y: cellH))
+        for c in 1..<cols {
+            let x = c * cellW
+            ctx.move(to: CGPoint(x: x, y: 0))
+            ctx.addLine(to: CGPoint(x: x, y: gridH))
+        }
+        for r in 1..<rows {
+            let y = r * cellH
+            ctx.move(to: CGPoint(x: 0, y: y))
+            ctx.addLine(to: CGPoint(x: gridW, y: y))
+        }
         ctx.strokePath()
 
         return ctx.makeImage()

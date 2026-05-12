@@ -23,17 +23,18 @@ final class DUMLPacketBuilderTests: XCTestCase {
         let headerCRC = CRC8.compute(Data([packet[0], packet[1], packet[2]]))
         XCTAssertEqual(packet[3], headerCRC)
 
-        // Sender should be mobileApp (0x02) at index 1
-        let senderType = (packet[4] >> 3) & 0x1F
-        let senderIndex = packet[4] & 0x07
+        // Packet byte layout: type in low 5 bits, index in high 3 bits
+        // (matches DUMLPacketBuilder: `(index << 5) | (type & 0x1F)`).
+        // Default index is 0 for both sender and receiver.
+        let senderType  = packet[4] & 0x1F
+        let senderIndex = (packet[4] >> 5) & 0x07
         XCTAssertEqual(senderType, DUMLConstants.DeviceType.mobileApp.rawValue)
-        XCTAssertEqual(senderIndex, 1)
+        XCTAssertEqual(senderIndex, 0)
 
-        // Receiver should be gimbal (0x04) at index 1
-        let receiverType = (packet[5] >> 3) & 0x1F
-        let receiverIndex = packet[5] & 0x07
+        let receiverType  = packet[5] & 0x1F
+        let receiverIndex = (packet[5] >> 5) & 0x07
         XCTAssertEqual(receiverType, DUMLConstants.DeviceType.gimbal.rawValue)
-        XCTAssertEqual(receiverIndex, 1)
+        XCTAssertEqual(receiverIndex, 0)
 
         // Command set and ID
         XCTAssertEqual(packet[9], DUMLConstants.CmdSet.battery.rawValue)

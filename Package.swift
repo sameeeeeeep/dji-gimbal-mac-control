@@ -15,6 +15,12 @@ let package = Package(
                 .product(name: "SpeakerKit", package: "WhisperKit"),
             ],
             path: "Sources",
+            exclude: ["JournalHarness"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "JournalHarness",
+            path: "Sources/JournalHarness",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

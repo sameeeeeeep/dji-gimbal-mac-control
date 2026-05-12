@@ -107,7 +107,15 @@ final class WhisperTranscriber: ObservableObject {
     // MARK: - Audio capture
 
     private func beginCapture() {
+        // Refuse to start if only the laptop mic is available. We never use
+        // the laptop mic — see PreferredAudioInput.
+        guard PreferredAudioInput.hasNonLaptopMic else {
+            logger.warning("WhisperTranscriber: no non-laptop mic available — not starting")
+            isTranscribing = false
+            return
+        }
         let engine = AVAudioEngine()
+        PreferredAudioInput.apply(to: engine)
         let inputNode = engine.inputNode
         let inputFmt = inputNode.outputFormat(forBus: 0)
 
