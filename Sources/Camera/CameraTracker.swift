@@ -139,13 +139,8 @@ final class CameraTracker: NSObject, ObservableObject {
     // MARK: - Point-and-go navigation
     /// True while a tap-to-navigate move is in progress.
     @Published var isNavigating: Bool = false
-    private var navTarget: (yaw: Double, pitch: Double)? = nil
     private var navTimer: Timer? = nil
     private var navStartTime: Date = .distantPast
-    /// Degrees within target before we declare arrival.
-    private let navArrivalDeg: Double = 8.0
-    /// Hard upper bound — prevents indefinite navigation when BLE position is stale.
-    private let navTimeoutSeconds: TimeInterval = 5.0
 
     private var sweepTimer: Timer?
     private var autoFollowAfterSweep: Bool = true
@@ -952,53 +947,26 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // MARK: - Point-and-go navigation
 
-    /// Navigate gimbal to the given absolute (yaw, pitch) using speed commands,
-    /// polling the current position every 100 ms until arrival.
+    /// Navigate gimbal to the given absolute (yaw, pitch) using a single
+    /// gimbal-managed smooth absolute move. Avoids overshoot from BLE feedback latency.
     func navigateTo(yaw: Double, pitch: Double) {
-        stopNavigation()
-        navTarget = (yaw: yaw, pitch: pitch)
-        navStartTime = Date()
+        stopNavigation()  // cancel any previous
+        let cur = getCurrentPosition?() ?? GimbalPosition()
+        let yawDelta   = abs(yaw - cur.yaw)
+        let pitchDelta = abs(pitch - cur.pitch)
+        let totalDeg = yawDelta + pitchDelta
+        // ~10 ms per degree, clamped [300 ms, 1000 ms]. timeUnits is 10ms.
+        let timeUnits = UInt8(max(30, min(100, Int(totalDeg * 1.0))))
         isNavigating = true
-        navTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.navTick() }
+        navStartTime = Date()
+        onAbsoluteMove?(yaw, pitch, timeUnits)
+        logger.info("NAV: → yaw=\(String(format: "%.0f", yaw))° pitch=\(String(format: "%.0f", pitch))° (\(timeUnits * 10) ms)")
+        // Auto-clear isNavigating after the motion completes.
+        navTimer?.invalidate()
+        navTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(timeUnits) * 0.01 + 0.1,
+                                        repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.stopNavigation() }
         }
-        onRequestPosition?()
-        logger.info("NAV: → yaw=\(String(format: "%.0f", yaw))° pitch=\(String(format: "%.0f", pitch))°")
-    }
-
-    private func navTick() {
-        // Hard timeout prevents infinite navigation when BLE position data is stale
-        if Date().timeIntervalSince(navStartTime) > navTimeoutSeconds {
-            onSpeedCommand?(0, 0)
-            stopNavigation()
-            logger.warning("NAV: timeout — stopping")
-            return
-        }
-
-        guard let target = navTarget,
-              let pos = getCurrentPosition?() else { return }
-        onRequestPosition?()
-
-        let dyaw   = target.yaw   - pos.yaw
-        let dpitch = target.pitch - pos.pitch
-
-        if abs(dyaw) < navArrivalDeg && abs(dpitch) < navArrivalDeg {
-            onSpeedCommand?(0, 0)
-            stopNavigation()
-            // The locked subject is now near frame center after the pan.
-            // Re-anchor the follow lock to (0.5, 0.5) so the follow loop
-            // tracks the centered subject instead of chasing whatever is
-            // closest to the original off-center click coordinate.
-            if lockedTargetPoint != nil {
-                lockedTargetPoint = CGPoint(x: 0.5, y: 0.5)
-            }
-            logger.info("NAV: arrived")
-            return
-        }
-
-        let yawSpeed   = abs(dyaw)   < navArrivalDeg ? 0.0 : (dyaw   > 0 ? sweepYawFast   : -sweepYawFast)
-        let pitchSpeed = abs(dpitch) < navArrivalDeg ? 0.0 : (dpitch > 0 ? sweepPitchFast : -sweepPitchFast)
-        onSpeedCommand?(yawSpeed, pitchSpeed)
     }
 
     /// Cancel any in-progress click-to-aim / point-and-go navigation. Public so
@@ -1007,7 +975,6 @@ final class CameraTracker: NSObject, ObservableObject {
     func stopNavigation() {
         navTimer?.invalidate()
         navTimer = nil
-        navTarget = nil
         isNavigating = false
     }
 
@@ -1172,8 +1139,11 @@ final class CameraTracker: NSObject, ObservableObject {
 
         // ── Face map ──────────────────────────────────────────────────────────
         for subject in allSubjects {
+            // Compensate for bbox offset — gimbal sweep angle ≠ centering angle.
+            // Vision bbox uses bottom-left origin: midY > 0.5 means face is above
+            // frame center, so we tilt UP (positive pitch delta).
             let faceOffsetYaw   = (Double(subject.bbox.midX) - 0.5) * cameraFOVDeg
-            let faceOffsetPitch = (0.5 - Double(subject.bbox.midY)) * (cameraFOVDeg * 0.75)
+            let faceOffsetPitch = (Double(subject.bbox.midY) - 0.5) * cameraFOVDeg * (9.0 / 16.0)
             let absYaw   = clampYaw(pos.yaw   + faceOffsetYaw)
             let absPitch = clampPitch(pos.pitch + faceOffsetPitch)
 
