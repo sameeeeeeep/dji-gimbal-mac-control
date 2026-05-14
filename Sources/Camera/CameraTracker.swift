@@ -902,13 +902,21 @@ final class CameraTracker: NSObject, ObservableObject {
                 : nil
         })
 
+        // Use absoluteRotate (gimbal-managed smooth motion) instead of
+        // navigateTo (speed-based polling). The speed path overshoots badly
+        // on short clicks because BLE position feedback lags and the gimbal
+        // can't decelerate before passing the target. Time scales with
+        // distance — ~10ms per degree, clamped 30–100 (300–1000ms).
+        let totalDeg = abs(yawDelta) + abs(pitchDelta)
+        let timeUnits = UInt8(max(30, min(100, Int(totalDeg * 1.0))))
+
         if hitSubject != nil {
             // Lock onto the subject. Start follow so it stays centered when it moves.
             lockedTargetPoint = p
             lockedSubjectBbox = nil
             if !isFollowing { startFollow() }
             // Pan there now; the follow loop will fine-tune as new bboxes arrive.
-            navigateTo(yaw: targetYaw, pitch: targetPitch)
+            onAbsoluteMove?(targetYaw, targetPitch, timeUnits)
             logger.info("AIM: subject lock at (\(String(format: "%.2f", p.x), privacy: .public),\(String(format: "%.2f", p.y), privacy: .public)) → yaw=\(String(format: "%.0f", targetYaw), privacy: .public) pitch=\(String(format: "%.0f", targetPitch), privacy: .public)")
         } else {
             // Empty-space click. Stop follow so the pan isn't immediately
@@ -916,7 +924,7 @@ final class CameraTracker: NSObject, ObservableObject {
             lockedTargetPoint = nil
             lockedSubjectBbox = nil
             if isFollowing { stopFollow() }
-            navigateTo(yaw: targetYaw, pitch: targetPitch)
+            onAbsoluteMove?(targetYaw, targetPitch, timeUnits)
             logger.info("AIM: empty-space pan → yaw=\(String(format: "%.0f", targetYaw), privacy: .public) pitch=\(String(format: "%.0f", targetPitch), privacy: .public)")
         }
     }
@@ -1860,8 +1868,9 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     //      and restore the prior follow state.
 
     /// Maximum yaw swing for a full-image-width finger vector (degrees).
-    private static let pointSeekYawScale:   Double = 90
-    private static let pointSeekPitchScale: Double = 45
+    /// Aggressive scale — a strong point should sweep most of the room.
+    private static let pointSeekYawScale:   Double = 160
+    private static let pointSeekPitchScale: Double = 60
     /// How long to wait at the destination before giving up (seconds).
     private static let pointSeekSearchSec:  TimeInterval = 2.5
     /// Approximate rotate-arrival delay so we don't try to detect faces mid-swing.
@@ -1928,20 +1937,32 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
 
         case .searching:
-            // Subject appeared? Lock onto it.
-            let foundSubject = !allSubjects.isEmpty || detectedBbox != nil
-            if foundSubject {
-                logger.info("POINT-SEEK: subject found — starting follow")
+            // Opportunistically lock onto any subject near the new frame
+            // centre. We deliberately ignore subjects at the edge — those
+            // are usually the pointer themselves dragged along by the pan.
+            let center = CGPoint(x: 0.5, y: 0.5)
+            let centerRadius: CGFloat = 0.25
+            let nearCenter: (CGRect) -> Bool = { bbox in
+                let dx = bbox.midX - center.x
+                let dy = bbox.midY - center.y
+                return (dx * dx + dy * dy).squareRoot() < centerRadius
+            }
+            let candidate: CGRect? = allSubjects.map(\.bbox).first(where: nearCenter)
+                ?? (detectedBbox.flatMap { nearCenter($0) ? $0 : nil })
+            if candidate != nil {
+                logger.info("POINT-SEEK: subject found near centre — starting follow")
                 cleanupPointSeek()
                 if !isFollowing { startFollow() }
                 return
             }
-            // Time's up — go home.
+            // Time's up — stay at the pointed direction. No auto-return.
+            // The user pointed there deliberately; if no subject appeared
+            // we keep the camera aimed where they asked and let them issue
+            // another gesture / click to redirect.
             if elapsed >= Self.pointSeekSearchSec {
-                logger.info("POINT-SEEK: nothing found → returning to \(self.pointSeekHomeYaw)°,\(self.pointSeekHomePitch)°")
-                pointSeekPhase      = .returning
-                pointSeekPhaseStart = Date()
-                onAbsoluteMove?(pointSeekHomeYaw, pointSeekHomePitch, 70)
+                logger.info("POINT-SEEK: nothing found — staying at pointed direction")
+                cleanupPointSeek()
+                // Don't restart follow — there's nothing to follow.
             }
 
         case .returning:
