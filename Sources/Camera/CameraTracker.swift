@@ -242,7 +242,29 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // MARK: - Active-speaker label (published to WhisperTranscriber for attribution)
     /// Set to the label of whoever is currently speaking; nil when nobody is.
-    @Published var activeSpeakerLabel: String? = nil
+    @Published var activeSpeakerLabel: String? = nil {
+        didSet {
+            if oldValue != activeSpeakerLabel {
+                handleActiveSpeakerLabelChange(oldValue: oldValue, newValue: activeSpeakerLabel)
+            }
+        }
+    }
+
+    // MARK: - Speaker-identity binding
+    /// Identity UUID associated with each SubjectMapEntry, keyed by speakerNumber.
+    /// Populated when the user names a person via the subjectMap UI.
+    @Published var subjectIdentityID: [Int: UUID] = [:]
+    /// Identity UUID associated with each diarization speaker label
+    /// (e.g. "Speaker 1" → UUID). Session-only, rebuilt by SpeakerBinder.
+    @Published var speakerLabelToIdentityID: [String: UUID] = [:]
+    /// When on, the gimbal navigates to a bound speaker's saved
+    /// (yaw, pitch) whenever they start talking and are off-camera.
+    @Published var speakerFollowMode: Bool = false
+
+    /// Session-only binder for (diarization speakerLabel) → (identity UUID).
+    private let speakerBinder = SpeakerBinder()
+    /// Driven by the activeSpeakerLabel didSet to enforce the >1s dwell.
+    private var speakerBindTimer: Timer?
 
     // MARK: - Capture state
     @Published var isRecording = false
@@ -1483,6 +1505,166 @@ final class CameraTracker: NSObject, ObservableObject {
     private static func powerScale(_ x: Double) -> Double {
         guard x != 0 else { return 0 }
         return (x < 0 ? -1 : 1) * pow(abs(x), 0.7)
+    }
+
+    // MARK: - Speaker-identity binding (Feature 1 + 2)
+
+    /// Bind a user-entered name to the subject map entry with the given index.
+    /// Tries best-effort to:
+    ///   1. Find the on-screen subject matching this speakerNumber.
+    ///   2. Crop their face, generate a feature print.
+    ///   3. If a near-duplicate identity exists → rename in place.
+    ///      Otherwise tag a new identity.
+    ///   4. Record the resulting UUID in `subjectIdentityID[speakerNumber]`.
+    /// Always writes `name` onto the SubjectMapEntry regardless of face availability.
+    func bindNameToSubjectMapEntry(index idx: Int, name rawName: String) {
+        guard idx >= 0, idx < subjectMap.count else { return }
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let speakerN = subjectMap[idx].speakerNumber
+
+        // Always update the entry name first (nil if cleared).
+        subjectMap[idx].name = trimmed.isEmpty ? nil : trimmed
+
+        guard !trimmed.isEmpty else {
+            // Clearing the name → drop any cached identity for this speaker number.
+            if let oldID = subjectIdentityID.removeValue(forKey: speakerN) {
+                logger.info("SPEAKER-FOLLOW: cleared identity binding for speaker \(speakerN) (was \(oldID))")
+            }
+            return
+        }
+
+        // Try to locate the live face matching this speakerNumber.
+        // DetectedSubject.speakerLabel is "Speaker N" once diarization has fired.
+        let labelGuess = "Speaker \(speakerN)"
+        let liveSubject = allSubjects.first(where: { $0.speakerLabel == labelGuess })
+            ?? allSubjects.first(where: { Int($0.speakerLabel ?? "") == speakerN - 1 })
+
+        guard let subject = liveSubject,
+              let frame = captureCurrentFrame(),
+              let crop = FaceRecognizer.cropFace(from: frame, bbox: subject.bbox)
+        else {
+            logger.info("SPEAKER-FOLLOW: named speaker \(speakerN) '\(trimmed)' — no live face crop, name-only binding")
+            return
+        }
+
+        // Match-first to avoid duplicate entries; fall back to a fresh tag.
+        if let existingID = faceRecognizer.matchFaceID(crop: crop) {
+            faceRecognizer.rename(id: existingID, to: trimmed)
+            subjectIdentityID[speakerN] = existingID
+            logger.info("SPEAKER-FOLLOW: renamed identity \(existingID) → '\(trimmed)' for speaker \(speakerN)")
+        } else if let newID = faceRecognizer.tagAndReturnID(crop: crop, name: trimmed) {
+            subjectIdentityID[speakerN] = newID
+            logger.info("SPEAKER-FOLLOW: tagged new identity \(newID) '\(trimmed)' for speaker \(speakerN)")
+        }
+    }
+
+    /// Driven by `activeSpeakerLabel.didSet`. Treats vision's active-speaker
+    /// label as the diarization speakerLabel (matching the existing pipeline).
+    /// Starts a >1s dwell timer; on tick, if the same label is still active
+    /// AND a face crop is available, binds it to an identity.
+    private func handleActiveSpeakerLabelChange(oldValue: String?, newValue: String?) {
+        speakerBindTimer?.invalidate()
+        speakerBindTimer = nil
+        guard let label = newValue else { return }
+        let startedAt = Date()
+        speakerBindTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
+            Task { @MainActor [weak self] in
+                guard let self else { t.invalidate(); return }
+                // Cancelled if the active speaker changed under us.
+                guard self.activeSpeakerLabel == label else { t.invalidate(); return }
+                self.tickSpeakerBind(label: label, since: startedAt)
+            }
+        }
+
+        // Speaker-follow steering: if speakerFollowMode is on and the new label
+        // is bound to a known identity that is NOT currently visible, navigate.
+        if speakerFollowMode {
+            handleSpeakerFollowSteering(forLabel: label)
+        }
+    }
+
+    @MainActor
+    private func tickSpeakerBind(label: String, since: Date) {
+        // Locate the on-screen subject matching this diarization label.
+        guard let subject = allSubjects.first(where: { $0.speakerLabel == label }) else {
+            speakerBinder.resetPending(speakerLabel: label)
+            return
+        }
+        // Need a face crop + feature print to map this label → identity.
+        guard let frame = captureCurrentFrame(),
+              let crop = FaceRecognizer.cropFace(from: frame, bbox: subject.bbox)
+        else { return }
+
+        let now = Date()
+        let candidateID: UUID? = faceRecognizer.matchFaceID(crop: crop)
+            ?? identityIDFromSubjectMap(label: label)
+
+        guard let id = candidateID else { return }
+        speakerBinder.observe(speakerLabel: label, identityID: id, now: now)
+
+        // Mirror committed bindings into the published dict.
+        if let bound = speakerBinder.identity(for: label),
+           speakerLabelToIdentityID[label] != bound {
+            speakerLabelToIdentityID[label] = bound
+            logger.info("SPEAKER-FOLLOW: bound \(label, privacy: .public) → \(bound, privacy: .public) after dwell")
+        }
+
+        // Stop the timer once we have a committed binding.
+        if speakerBinder.identity(for: label) != nil,
+           now.timeIntervalSince(since) >= SpeakerBinder.dwellSeconds {
+            speakerBindTimer?.invalidate()
+            speakerBindTimer = nil
+        }
+    }
+
+    /// If the live subject for this label has a `speakerNumber` already tied
+    /// to an entry in `subjectIdentityID`, use that as the candidate identity.
+    private func identityIDFromSubjectMap(label: String) -> UUID? {
+        // "Speaker 3" → 3
+        let parts = label.split(separator: " ")
+        guard parts.count >= 2, let n = Int(parts.last ?? "") else { return nil }
+        return subjectIdentityID[n]
+    }
+
+    // MARK: - Speaker-follow mode (Feature 3)
+
+    /// When `speakerFollowMode` is on and a new speaker starts talking,
+    /// navigate the gimbal to their saved (yaw, pitch) IF they aren't visible.
+    private func handleSpeakerFollowSteering(forLabel label: String) {
+        guard speakerFollowMode else { return }
+
+        // If the speaker is already in the frame, the existing follow loop handles them.
+        if allSubjects.contains(where: { $0.speakerLabel == label }) {
+            logger.info("SPEAKER-FOLLOW: \(label, privacy: .public) visible — follow loop will track")
+            return
+        }
+
+        // Look up the bound identity → subjectMap entry → yaw/pitch.
+        guard let identityID = speakerLabelToIdentityID[label]
+                ?? identityIDFromSubjectMap(label: label) else {
+            logger.info("SPEAKER-FOLLOW: \(label, privacy: .public) has no identity binding — skip")
+            return
+        }
+
+        guard let entry = subjectMap.first(where: { e in
+            subjectIdentityID[e.speakerNumber] == identityID
+        }) else {
+            logger.info("SPEAKER-FOLLOW: identity \(identityID, privacy: .public) has no subjectMap entry — skip")
+            return
+        }
+
+        logger.info("SPEAKER-FOLLOW: navigating to \(entry.name ?? "unnamed", privacy: .public) at yaw=\(String(format: "%.0f", entry.approximateYaw))° pitch=\(String(format: "%.0f", entry.approximatePitch))°")
+        navigateTo(yaw: entry.approximateYaw, pitch: entry.approximatePitch)
+    }
+
+    /// Drop bindings whose identity has been forgotten from FaceRecognizer.
+    /// Call after `faceRecognizer.removeFace(id:)`.
+    func reconcileSpeakerBindings() {
+        let valid = Set(faceRecognizer.knownFaces.map { $0.id })
+        speakerBinder.reconcile(validIDs: valid)
+        // Also flush the published dicts.
+        speakerLabelToIdentityID = speakerLabelToIdentityID.filter { valid.contains($0.value) }
+        subjectIdentityID        = subjectIdentityID.filter        { valid.contains($0.value) }
     }
 }
 

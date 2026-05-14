@@ -113,6 +113,62 @@ final class FaceRecognizer: ObservableObject {
         save()
     }
 
+    /// Rename an existing known face in place. No-op if the id is unknown.
+    func rename(id: UUID, to newName: String) {
+        guard let idx = knownFaces.firstIndex(where: { $0.id == id }) else { return }
+        knownFaces[idx].name = newName
+        save()
+        logger.info("FaceRecognizer: renamed \(id) → '\(newName)'")
+    }
+
+    /// Find the closest stored face for `crop`. Returns the stored face's UUID
+    /// (not just the name) so callers can bind speaker labels to identities.
+    /// Runs on MainActor — generates a feature print and matches synchronously.
+    func matchFaceID(crop: CGImage) -> UUID? {
+        guard let newPrint = featurePrint(for: crop) else { return nil }
+        var bestID: UUID? = nil
+        var bestDist: Float = .greatestFiniteMagnitude
+        for face in knownFaces {
+            guard let stored = try? NSKeyedUnarchiver.unarchivedObject(
+                ofClass: VNFeaturePrintObservation.self,
+                from: face.featurePrintData
+            ) else { continue }
+            var dist: Float = 0
+            if (try? newPrint.computeDistance(&dist, to: stored)) != nil, dist < bestDist {
+                bestDist = dist
+                bestID = face.id
+            }
+        }
+        return (bestDist < distanceThreshold) ? bestID : nil
+    }
+
+    /// Tag a new face and return the freshly-created identity's UUID.
+    /// If a matching name already exists it is replaced in place and that
+    /// id is returned. Returns nil only on feature-print failure.
+    @discardableResult
+    func tagAndReturnID(crop: CGImage, name: String) -> UUID? {
+        guard let print = featurePrint(for: crop) else {
+            logger.error("FaceRecognizer: failed to generate feature print for '\(name)'")
+            return nil
+        }
+        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: print,
+                                                            requiringSecureCoding: true) else {
+            logger.error("FaceRecognizer: failed to archive feature print for '\(name)'")
+            return nil
+        }
+        if let idx = knownFaces.firstIndex(where: { $0.name.lowercased() == name.lowercased() }) {
+            let existingID = knownFaces[idx].id
+            knownFaces[idx] = KnownFace(id: existingID, name: name, featurePrintData: data)
+            save()
+            return existingID
+        }
+        let face = KnownFace(id: UUID(), name: name, featurePrintData: data)
+        knownFaces.append(face)
+        save()
+        logger.info("FaceRecognizer: tagged '\(name)' (id=\(face.id)) — \(self.knownFaces.count) total")
+        return face.id
+    }
+
     private func save() {
         do {
             let data = try JSONEncoder().encode(knownFaces)

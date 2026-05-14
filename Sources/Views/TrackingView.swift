@@ -138,6 +138,9 @@ private struct OperatorSidebar: View {
             // ── Always-on controls (these stay visible in every tab) ──
             FollowButton(gimbal: gimbal, tracker: tracker)
                 .frame(height: 56)
+            Rectangle().fill(DS.divider.opacity(0.6)).frame(height: 1)
+            SpeakerFollowToggle(gimbal: gimbal, tracker: tracker)
+                .frame(height: 30)
             Rectangle().fill(DS.divider).frame(height: 1)
 
             QuickActions(gimbal: gimbal, tracker: tracker)
@@ -832,6 +835,45 @@ private struct FollowButton: View {
     }
 }
 
+// MARK: - Speaker-follow toggle
+//
+// Drives `CameraTracker.speakerFollowMode`. When on, the gimbal navigates to
+// the saved (yaw, pitch) of whoever starts talking once their diarization
+// label has been bound to a stored identity. Disabled until camera+gimbal are
+// both live.
+
+private struct SpeakerFollowToggle: View {
+    @ObservedObject var gimbal:  GimbalService
+    @ObservedObject var tracker: CameraTracker
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: tracker.speakerFollowMode ? "mic.circle.fill" : "mic.circle")
+                .font(.system(size: 14))
+                .foregroundColor(tracker.speakerFollowMode ? DS.green : .white.opacity(0.5))
+            Text("SPEAKER FOLLOW")
+                .font(.system(size: 10, weight: .black, design: .monospaced))
+                .tracking(2)
+                .foregroundColor(.white.opacity(enabled ? 0.85 : 0.35))
+            Spacer()
+            Toggle("", isOn: $tracker.speakerFollowMode)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .tint(DS.green)
+                .labelsHidden()
+                .disabled(!enabled)
+        }
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(DS.surface)
+        .opacity(enabled ? 1 : 0.45)
+    }
+
+    private var enabled: Bool {
+        tracker.isRunning && gimbal.state.connectionState.isConnected
+    }
+}
+
 // MARK: - Quick actions row
 
 private struct QuickActions: View {
@@ -1377,6 +1419,16 @@ private struct DynamicCanvas: View {
         self.journal  = tracker.journalAnalyzer
     }
 
+    /// Resolve the FaceRecognizer name bound to the given subject map entry,
+    /// if any. Falls back to entry.name when no identity is bound.
+    fileprivate func boundIdentityName(for entry: SubjectMapEntry) -> String? {
+        if let id = tracker.subjectIdentityID[entry.speakerNumber],
+           let face = tracker.faceRecognizer.knownFaces.first(where: { $0.id == id }) {
+            return face.name
+        }
+        return entry.name
+    }
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             content
@@ -1436,17 +1488,22 @@ private struct DynamicCanvas: View {
                     ForEach(tracker.subjectMap.indices, id: \.self) { idx in
                         PersonTagRow(
                             entry: tracker.subjectMap[idx],
+                            boundIdentityName: boundIdentityName(for: tracker.subjectMap[idx]),
                             onTap: {
                                 tracker.navigateTo(yaw: tracker.subjectMap[idx].approximateYaw,
                                                    pitch: tracker.subjectMap[idx].approximatePitch)
                             },
                             onNameChange: { name in
-                                tracker.subjectMap[idx].name = name.isEmpty ? nil : name
+                                tracker.bindNameToSubjectMapEntry(index: idx, name: name)
                             }
                         )
                         .padding(.horizontal, 8)
                         .background(DS.surface2.opacity(0.9))
                     }
+                    SpeakerBindingsBadge(tracker: tracker)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(DS.surface2.opacity(0.9))
                 }
             )
 
@@ -2375,9 +2432,11 @@ private struct SplatMapView: View {
 // MARK: - Person tag row
 
 private struct PersonTagRow: View {
-    let entry:        SubjectMapEntry
-    let onTap:        () -> Void
-    let onNameChange: (String) -> Void
+    let entry:              SubjectMapEntry
+    /// Name resolved via the bound identity (FaceRecognizer); falls back to entry.name.
+    let boundIdentityName:  String?
+    let onTap:              () -> Void
+    let onNameChange:       (String) -> Void
     @State private var nameText = ""
 
     var body: some View {
@@ -2397,13 +2456,56 @@ private struct PersonTagRow: View {
                 .foregroundColor(.white.opacity(0.35))
                 .frame(width: 55, alignment: .leading)
 
-            TextField("name…", text: $nameText)
+            TextField(displayPlaceholder, text: $nameText)
                 .font(.system(size: 9, design: .monospaced))
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { onNameChange(nameText) }
                 .onChange(of: nameText) { _, v in onNameChange(v) }
         }
         .padding(.vertical, 3)
-        .onAppear { nameText = entry.name ?? "" }
+        .onAppear {
+            // Prefer the FaceRecognizer-bound name when present; falls back
+            // to the entry's stored name; otherwise empty so placeholder shows.
+            nameText = boundIdentityName ?? entry.name ?? ""
+        }
+    }
+
+    private var displayPlaceholder: String {
+        if boundIdentityName != nil { return "name…" }
+        return entry.name ?? "Unknown"
+    }
+}
+
+// MARK: - Speaker → identity bindings badge
+
+/// Compact one-line listing of the active (diarization speakerLabel → name)
+/// bindings. Hidden when there are no bindings yet.
+private struct SpeakerBindingsBadge: View {
+    @ObservedObject var tracker: CameraTracker
+
+    var body: some View {
+        if tracker.speakerLabelToIdentityID.isEmpty {
+            EmptyView()
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "person.wave.2.fill")
+                    .font(.system(size: 8))
+                    .foregroundColor(DS.green.opacity(0.7))
+                Text(text)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.7))
+                    .lineLimit(1)
+                Spacer()
+            }
+        }
+    }
+
+    private var text: String {
+        // Sort labels for stable display.
+        let pairs = tracker.speakerLabelToIdentityID.sorted(by: { $0.key < $1.key }).map { kv -> String in
+            let name = tracker.faceRecognizer.knownFaces.first(where: { $0.id == kv.value })?.name ?? "?"
+            return "\(kv.key) → \(name)"
+        }
+        return pairs.joined(separator: "   ")
     }
 }
