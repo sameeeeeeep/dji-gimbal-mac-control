@@ -101,6 +101,11 @@ final class CameraTracker: NSObject, ObservableObject {
     /// Yaw/pitch the gimbal was at when seek started — restored on failure.
     private var pointSeekHomeYaw:   Double = 0
     private var pointSeekHomePitch: Double = 0
+    /// The yaw/pitch the user actually pointed at — anchor for the scout sweep.
+    private var pointSeekTargetYaw:   Double = 0
+    private var pointSeekTargetPitch: Double = 0
+    /// Sub-phase of `.searching` — which direction the scout sweep is heading.
+    private var pointSeekScoutStep: Int = 0
     private var pointSeekPhaseStart: Date?
     private var pointSeekTimer:     Timer?
     /// Whether follow was active before seek (so we can restore it on failure).
@@ -312,6 +317,7 @@ final class CameraTracker: NSObject, ObservableObject {
     private let logger = Logger(subsystem: "com.gimbal.controller", category: "Camera")
     nonisolated(unsafe) private var bgTrackingType: TrackingType = .face
     nonisolated(unsafe) private var bgPalmFrameCount: Int = 0
+    nonisolated(unsafe) private var bgPalmDebugTick: UInt32 = 0
     nonisolated(unsafe) private var bgPeaceFrameCount: Int = 0
     nonisolated(unsafe) private var bgPointingFrameCount: Int = 0
     private let palmConfirmFrames: Int = 20  // ~0.67 s at 30 fps
@@ -1971,20 +1977,16 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         bgPointingFrameCount = 0
 
-        // ── Open palm: redirect follow (existing behaviour) ───────────────────
+        // ── Open palm: redirect follow ────────────────────────────────────────
         guard isOpenPalm(obs),
               let points = try? obs.recognizedPoints(.all),
               let wrist  = points[.wrist], wrist.confidence > 0.5 else {
-            let wasGuiding = bgPalmFrameCount >= palmConfirmFrames
+            // No qualifying palm — clear immediately so the badge state
+            // matches reality and the follow loop releases the palm guide.
             bgPalmFrameCount = 0
-            if wasGuiding {
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    self?.palmGuideBbox    = nil
-                    self?.palmGestureActive = false
-                    // Open palm no longer touches followLocked — only the
-                    // on-screen lock button can release a lock.
-                }
+            Task { @MainActor [weak self] in
+                self?.palmGuideBbox    = nil
+                self?.palmGestureActive = false
             }
             return
         }
@@ -1992,15 +1994,17 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         bgPalmFrameCount = min(bgPalmFrameCount + 1, palmConfirmFrames + 1)
         guard bgPalmFrameCount >= palmConfirmFrames else { return }
 
+        // Palm guide bbox is centered on the wrist — gimbal centers on the
+        // hand in the frame. We snapshot the wrist position at the moment of
+        // confirmation; subsequent ticks will refresh it as long as the palm
+        // stays visible.
         let cx = wrist.location.x
         let cy = wrist.location.y
-        let size: CGFloat = 0.08
+        let size: CGFloat = 0.10
         let synthBbox = CGRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size)
 
         Task { @MainActor [weak self] in
             guard let self, self.isRunning else { return }
-            // If already locked, palm gestures are inert — the lock owns the
-            // gimbal until the on-screen lock button releases it.
             guard !self.followLocked else { return }
             self.palmGuideBbox        = synthBbox
             self.palmGestureActive    = true
@@ -2023,8 +2027,15 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     /// Aggressive scale — a strong point should sweep most of the room.
     private static let pointSeekYawScale:   Double = 160
     private static let pointSeekPitchScale: Double = 60
-    /// How long to wait at the destination before giving up (seconds).
-    private static let pointSeekSearchSec:  TimeInterval = 2.5
+    /// Total search-phase budget (seconds). During this window the gimbal
+    /// performs a small scout sweep around the pointed direction so it can
+    /// actually FIND a subject who isn't exactly where the finger pointed.
+    private static let pointSeekSearchSec:  TimeInterval = 4.0
+    /// Half-width of the scout sweep in degrees — gimbal swings ±this much
+    /// around the pointed yaw, then comes back to centre.
+    private static let pointSeekScoutHalfDeg: Double = 18.0
+    /// Time to dwell at each scout step before moving on.
+    private static let pointSeekScoutStepSec: TimeInterval = 0.9
     /// Approximate rotate-arrival delay so we don't try to detect faces mid-swing.
     private static let pointSeekArrivalSec: TimeInterval = 0.75
     /// Time the rotate-home animation takes before we declare seek complete.
@@ -2060,6 +2071,11 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         let targetYaw   = max(-160, min(160, cur.yaw   + yawDelta))
         let targetPitch = max(-35,  min(35,  cur.pitch + pitchDelta))
 
+        // Remember target — the scout sweep during .searching pivots around this.
+        pointSeekTargetYaw   = targetYaw
+        pointSeekTargetPitch = targetPitch
+        pointSeekScoutStep   = 0
+
         // Pause active follow while seek runs
         if isFollowing { stopFollow() }
         followLocked = false
@@ -2085,7 +2101,8 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             if elapsed >= Self.pointSeekArrivalSec {
                 pointSeekPhase      = .searching
                 pointSeekPhaseStart = Date()
-                logger.info("POINT-SEEK: arrived, searching for subject")
+                pointSeekScoutStep  = 0
+                logger.info("POINT-SEEK: arrived, scouting for subject around pointed direction")
             }
 
         case .searching:
@@ -2107,12 +2124,33 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                 if !isFollowing { startFollow() }
                 return
             }
+
+            // No subject yet — keep scouting. Walk the gimbal through a
+            // small left/centre/right sweep around the pointed yaw so we
+            // actually FIND a subject who's slightly off from where the
+            // user's finger landed. Steps: 0=anchor, 1=+offset, 2=-offset,
+            // 3=anchor. Total ~3.6s at default step duration.
+            let stepIndex = Int(elapsed / Self.pointSeekScoutStepSec)
+            if stepIndex != pointSeekScoutStep && stepIndex <= 3 {
+                pointSeekScoutStep = stepIndex
+                let offset: Double
+                switch stepIndex {
+                case 1:  offset = +Self.pointSeekScoutHalfDeg
+                case 2:  offset = -Self.pointSeekScoutHalfDeg
+                default: offset = 0   // step 0 and 3 → anchor
+                }
+                let scoutYaw = max(-160, min(160, pointSeekTargetYaw + offset))
+                onAbsoluteMove?(scoutYaw, pointSeekTargetPitch, 50)
+                logger.info("POINT-SEEK: scout step \(stepIndex) → yaw=\(String(format: "%.0f", scoutYaw))°")
+            }
+
             // Time's up — stay at the pointed direction. No auto-return.
             // The user pointed there deliberately; if no subject appeared
             // we keep the camera aimed where they asked and let them issue
             // another gesture / click to redirect.
             if elapsed >= Self.pointSeekSearchSec {
-                logger.info("POINT-SEEK: nothing found — staying at pointed direction")
+                logger.info("POINT-SEEK: nothing found after scout — staying at pointed direction")
+                onAbsoluteMove?(pointSeekTargetYaw, pointSeekTargetPitch, 50)
                 cleanupPointSeek()
                 // Don't restart follow — there's nothing to follow.
             }
@@ -2201,24 +2239,41 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         return indexTip.location
     }
 
-    /// Returns true if the observation looks like an open palm:
-    /// at least 4 of 5 fingertips detected with high confidence AND
-    /// each fingertip is far enough from the wrist that the finger is clearly extended.
+    /// Returns true if the observation looks like an open palm held up.
+    /// Requirements:
+    ///   - Wrist visible with high confidence.
+    ///   - At least 3 of the 4 non-thumb fingertips visible.
+    ///   - At least 3 visible fingertips clearly extended (>= 0.12 from wrist).
+    ///
+    /// Logs the metrics so we can tune thresholds against real data instead
+    /// of guessing. Throttled to ~5 Hz to avoid flooding the log.
     nonisolated private func isOpenPalm(_ obs: VNHumanHandPoseObservation) -> Bool {
         guard let points = try? obs.recognizedPoints(.all) else { return false }
         guard let wrist = points[.wrist], wrist.confidence > 0.5 else { return false }
 
-        let tipJoints: [VNHumanHandPoseObservation.JointName] = [
-            .thumbTip, .indexTip, .middleTip, .ringTip, .littleTip
+        let fingers: [VNHumanHandPoseObservation.JointName] = [
+            .indexTip, .middleTip, .ringTip, .littleTip
         ]
-        var extendedCount = 0
-        for joint in tipJoints {
+        var visible = 0
+        var extended = 0
+        var maxDist: CGFloat = 0
+        for joint in fingers {
             guard let tip = points[joint], tip.confidence > 0.5 else { continue }
+            visible += 1
             let dx = tip.location.x - wrist.location.x
             let dy = tip.location.y - wrist.location.y
-            if sqrt(dx * dx + dy * dy) > 0.12 { extendedCount += 1 }
+            let dist = (dx * dx + dy * dy).squareRoot()
+            if dist > maxDist { maxDist = dist }
+            if dist > 0.12 { extended += 1 }
         }
-        return extendedCount >= 4
+        let pass = visible >= 3 && extended >= 3
+        // Throttle to ~5 Hz — at 30 fps this fires every 6th call.
+        bgPalmDebugTick &+= 1
+        if bgPalmDebugTick % 6 == 0 {
+            Logger(subsystem: "com.gimbal.controller", category: "Camera")
+                .info("PALM-DETECT: visible=\(visible) extended=\(extended)/\(visible) maxDist=\(String(format: "%.2f", maxDist)) wristY=\(String(format: "%.2f", wrist.location.y)) → \(pass ? "PASS" : "fail")")
+        }
+        return pass
     }
 
     /// Mouth openness = vertical lip span ÷ face bounding-box height.

@@ -24,6 +24,11 @@ final class BLEConnectionManager: NSObject, ObservableObject {
     private var scanTimer: Timer?
     private var writeType: CBCharacteristicWriteType = .withResponse
 
+    /// Set to a `(timeout)` when startScan() is called before the central
+    /// manager finished powering on. We replay it the moment we get
+    /// .poweredOn so callers don't have to retry manually.
+    private var deferredScanTimeout: TimeInterval? = nil
+
     /// All discovered CBCharacteristic objects keyed by UUID string for alternative writes
     private var characteristicMap: [String: CBCharacteristic] = [:]
 
@@ -41,8 +46,26 @@ final class BLEConnectionManager: NSObject, ObservableObject {
     // MARK: - Public API
 
     func startScan(timeout: TimeInterval = 10) {
-        guard centralManager.state == .poweredOn else {
-            connectionState = .error("Bluetooth not available")
+        switch centralManager.state {
+        case .poweredOn:
+            break  // good — continue
+        case .unknown, .resetting:
+            // Cold-launch race: CBCentralManager hasn't reported state yet.
+            // Stash the request and replay when .poweredOn lands.
+            logger.info("Scan requested before BLE ready — deferring")
+            deferredScanTimeout = timeout
+            return
+        case .poweredOff:
+            connectionState = .error("Bluetooth is off")
+            return
+        case .unauthorized:
+            connectionState = .error("Bluetooth unauthorized")
+            return
+        case .unsupported:
+            connectionState = .error("Bluetooth unsupported on this Mac")
+            return
+        @unknown default:
+            connectionState = .error("Bluetooth state unknown")
             return
         }
 
@@ -215,6 +238,15 @@ extension BLEConnectionManager: CBCentralManagerDelegate {
             switch central.state {
             case .poweredOn:
                 logger.info("Bluetooth powered on")
+                // Replay a scan request that arrived before we were ready.
+                if let timeout = self.deferredScanTimeout {
+                    self.deferredScanTimeout = nil
+                    // Also clear any stale error state from the early-scan attempt.
+                    if case .error = self.connectionState {
+                        self.connectionState = .disconnected
+                    }
+                    self.startScan(timeout: timeout)
+                }
             case .poweredOff:
                 connectionState = .error("Bluetooth is off")
             case .unauthorized:
